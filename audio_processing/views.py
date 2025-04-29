@@ -40,6 +40,42 @@ def check_rate_limit(request):
     cache.set(cache_key, requests + 1, RATE_LIMIT_WINDOW)
     return True
 
+def publish_event(event_type, payload):
+    """Publish an event to RabbitMQ"""
+    try:
+        connection = pika.BlockingConnection(
+            pika.ConnectionParameters(host=settings.RABBITMQ_HOST, port=settings.RABBITMQ_PORT)
+        )
+        channel = connection.channel()
+        
+        # Ensure exchange exists
+        channel.exchange_declare(exchange=settings.RABBITMQ_EXCHANGE, exchange_type='fanout')
+        
+        # Add event_type to payload
+        payload['event_type'] = event_type
+        
+        # Publish message
+        channel.basic_publish(
+            exchange=settings.RABBITMQ_EXCHANGE,
+            routing_key='',
+            body=json.dumps(payload)
+        )
+        connection.close()
+        logging.info(f"Published {event_type} event")
+        
+    except Exception as e:
+        logging.error(f"Error publishing event: {str(e)}")
+        raise
+
+def cleanup_audio_file(file_path):
+    """Remove audio file from the filesystem"""
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            logging.info(f"Cleaned up file: {file_path}")
+    except Exception as e:
+        logging.error(f"Error cleaning up file: {str(e)}")
+
 @csrf_exempt
 def upload_audio(request):
     if request.method != 'POST':
