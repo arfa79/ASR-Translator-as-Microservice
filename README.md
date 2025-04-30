@@ -16,7 +16,7 @@ All components communicate asynchronously through RabbitMQ events.
 
 - Python 3.11+
 - RabbitMQ Server
-- VOSK English model (vosk-model-en-us-0.22)
+- VOSK English model (vosk-model-small-en-us-0.15)
 
 ## Installation
 
