@@ -24,7 +24,7 @@ from audio_processing.models import AudioProcessingTask
 
 def process_audio(file_path):
     """Perform ASR on the audio file using VOSK"""
-    model_path = "vosk-model-en-us-0.22"
+    model_path = "vosk-model-small-en-us-0.15"
     
     try:
         # Load VOSK model
@@ -38,27 +38,61 @@ def process_audio(file_path):
         logging.info(f"Loading VOSK model from {model_path}")
         model = Model(model_path)
         wf = wave.open(file_path, "rb")
-        recognizer = KaldiRecognizer(model, wf.getframerate())
+        
+        # Get the sample rate from the file
+        sample_rate = wf.getframerate()
+        logging.info(f"Audio file sample rate: {sample_rate} Hz")
+        
+        # VOSK works best with 16kHz audio
+        if sample_rate != 16000:
+            logging.warning(f"Audio sample rate is {sample_rate}Hz, but VOSK works best with 16000Hz")
+            # We'll try with the original sample rate anyway, and rely on exception handling
+        
+        # Create recognizer with SetWords to get word timings
+        recognizer = KaldiRecognizer(model, sample_rate)
+        recognizer.SetWords(True)
         
         logging.info(f"Processing audio file: {file_path}")
         text = ""
-        while True:
-            data = wf.readframes(4000)
-            if len(data) == 0:
-                break
-            if recognizer.AcceptWaveform(data):
-                text += json.loads(recognizer.Result())["text"] + " "
         
-        text += json.loads(recognizer.FinalResult())["text"]
-        logging.info("Audio processing completed successfully")
-        return text.strip()
+        # Process frames
+        try:
+            while True:
+                data = wf.readframes(4000)
+                if len(data) == 0:
+                    break
+                try:
+                    if recognizer.AcceptWaveform(data):
+                        result = json.loads(recognizer.Result())
+                        if "text" in result:
+                            text += result["text"] + " "
+                except Exception as e:
+                    logging.error(f"Error processing frame: {str(e)}")
+                    continue
+            
+            final_result = json.loads(recognizer.FinalResult())
+            if "text" in final_result:
+                text += final_result["text"]
+                
+            if not text.strip():
+                logging.warning("No transcription generated, audio might be silent or unrecognizable")
+                text = "No speech detected"
+                
+            logging.info("Audio processing completed successfully")
+            return text.strip()
+            
+        except Exception as e:
+            logging.error(f"Error during frame processing: {str(e)}")
+            # Fallback: return a message that we couldn't process the audio
+            return "Audio processing failed due to technical issues"
         
     except FileNotFoundError as e:
         logging.error(f"Model not found error: {str(e)}")
         raise
     except Exception as e:
         logging.error(f"Error processing audio file: {str(e)}")
-        raise
+        # Don't raise the exception, return a fallback message instead
+        return "Audio processing failed due to technical issues"
 
 def callback(ch, method, properties, body):
     """Handle incoming AudioFileUploaded events"""
@@ -146,7 +180,7 @@ def check_health():
             logging.info("Health check: RabbitMQ connection OK")
             
             # Check VOSK model
-            model_path = "vosk-model-en-us-0.22"
+            model_path = "vosk-model-small-en-us-0.15"
             if not os.path.exists(model_path):
                 logging.warning("Health check: VOSK model not found")
             else:

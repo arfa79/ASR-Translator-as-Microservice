@@ -60,6 +60,17 @@ def callback(ch, method, properties, body):
         
         logging.info(f"Received TranscriptionGenerated event for file_id: {file_id}")
         
+        # Check if we have a valid transcription to translate
+        if not text or text in ["No speech detected", "Audio processing failed due to technical issues"]:
+            logging.warning(f"Received invalid or empty transcription: '{text}'")
+            # Update task with the error message
+            task = AudioProcessingTask.objects.get(file_id=file_id)
+            task.status = 'completed'
+            task.translation = f"خطا در پردازش صوت: {text}" if text else "خطا در پردازش صوت: متن خالی"
+            task.save()
+            logging.info(f"Updated task with error message for file_id: {file_id}")
+            return
+        
         # Update task status
         task = AudioProcessingTask.objects.get(file_id=file_id)
         task.status = 'translating'
@@ -100,7 +111,16 @@ def callback(ch, method, properties, body):
         
     except Exception as e:
         logging.error(f"Error in callback: {str(e)}")
-        raise
+        # Try to update the task with an error message
+        try:
+            if 'file_id' in locals():
+                task = AudioProcessingTask.objects.get(file_id=file_id)
+                task.status = 'completed'
+                task.translation = "خطا در ترجمه: مشکل فنی رخ داده است"
+                task.save()
+                logging.info(f"Updated task with error message for file_id: {file_id}")
+        except Exception as inner_e:
+            logging.error(f"Error updating task with error status: {str(inner_e)}")
 
 def get_rabbitmq_connection():
     retries = 5
