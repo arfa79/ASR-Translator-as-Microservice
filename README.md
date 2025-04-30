@@ -116,7 +116,8 @@ or
 A test script is provided to verify system functionality:
 
 ```bash
-python test_system.py path/to/test.wav
+cd tests
+sh run_tests.sh
 ```
 
 ## Features
