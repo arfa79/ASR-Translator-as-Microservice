@@ -38,7 +38,7 @@ pip install -r requirements.txt
 ```
 
 4. Download VOSK model:
-   - Download [vosk-model-en-us-0.22](https://alphacephei.com/vosk/models)
+   - Download [vosk-model-small-en-us-0.15](https://alphacephei.com/vosk/models)
    - Extract it to the project root directory
 
 5. Set up RabbitMQ:
