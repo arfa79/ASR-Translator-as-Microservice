@@ -6,6 +6,8 @@ import time
 import logging
 import threading
 import hashlib
+import zlib
+import base64
 from argostranslate import package, translate
 import redis
 
@@ -37,6 +39,8 @@ REDIS_DB = int(os.environ.get('REDIS_DB', 0))
 REDIS_ENABLED = os.environ.get('REDIS_ENABLED', 'True').lower() in ('true', '1', 't')
 CACHE_EXPIRY = 3600 * 24 * 1  # Cache for 1 day by default
 CPU_AFFINITY_ENABLED = os.environ.get('CPU_AFFINITY_ENABLED', 'True').lower() in ('true', '1', 't')
+USE_MESSAGE_COMPRESSION = True  # Enable/disable message compression
+COMPRESSION_THRESHOLD = 1024  # Compress messages larger than 1KB
 
 # Initialize Redis client if enabled
 redis_client = None
@@ -49,6 +53,33 @@ if REDIS_ENABLED:
         logging.warning(f"Redis cache connection failed: {str(e)}")
         logging.warning("Translation caching will be disabled")
         redis_client = None
+
+def decompress_message(message, content_encoding=None):
+    """Decompress a message if it's compressed"""
+    if not content_encoding or 'zlib+base64' not in content_encoding:
+        return message
+        
+    try:
+        # Decode base64, then decompress
+        decoded = base64.b64decode(message)
+        decompressed = zlib.decompress(decoded)
+        return decompressed.decode('utf-8')
+    except Exception as e:
+        logging.error(f"Error decompressing message: {str(e)}")
+        return message
+
+def compress_message(message):
+    """Compress a message using zlib if it's larger than threshold"""
+    if not USE_MESSAGE_COMPRESSION:
+        return message, False
+        
+    message_bytes = message.encode('utf-8')
+    if len(message_bytes) < COMPRESSION_THRESHOLD:
+        return message, False
+        
+    compressed = zlib.compress(message_bytes)
+    b64_compressed = base64.b64encode(compressed).decode('ascii')
+    return b64_compressed, True
 
 def set_cpu_affinity():
     """Set CPU affinity for the Translation service if psutil is available"""
@@ -158,7 +189,14 @@ def perform_translation(text):
 def callback(ch, method, properties, body):
     """Handle incoming TranscriptionGenerated events"""
     try:
-        message = json.loads(body)
+        # Handle compressed messages
+        content_encoding = properties.content_encoding if properties else None
+        if content_encoding and 'zlib+base64' in content_encoding:
+            body_str = decompress_message(body.decode('ascii'), content_encoding)
+            message = json.loads(body_str)
+            logging.info("Received compressed message")
+        else:
+            message = json.loads(body)
         
         if message['event_type'] != 'TranscriptionGenerated':
             return
@@ -167,6 +205,9 @@ def callback(ch, method, properties, body):
         text = message['text']
         
         logging.info(f"Received TranscriptionGenerated event for file_id: {file_id}")
+        
+        # Get message priority if available
+        message_priority = properties.priority if properties and hasattr(properties, 'priority') else None
         
         # Check if we have a valid transcription to translate
         if not text or text in ["No speech detected", "Audio processing failed due to technical issues"]:
@@ -201,19 +242,40 @@ def callback(ch, method, properties, body):
         )
         channel = connection.channel()
         
-        message = {
+        result_message = {
             'event_type': 'TranslationCompleted',
             'file_id': file_id,
             'translation': translation
         }
         
+        # Serialize and potentially compress the message
+        message_json = json.dumps(result_message)
+        message_data, is_compressed = compress_message(message_json)
+        
+        # Set message properties
+        message_props = {
+            'delivery_mode': 2,  # Make message persistent
+        }
+        
+        # Preserve original message priority
+        if message_priority:
+            message_props['priority'] = message_priority
+            
+        if is_compressed:
+            message_props['content_encoding'] = 'zlib+base64'
+            logging.info(f"Message compressed: {len(message_json)} -> {len(message_data)} bytes")
+        
+        publish_properties = pika.BasicProperties(**message_props)
+        
         channel.basic_publish(
             exchange=settings.RABBITMQ_EXCHANGE,
             routing_key='',
-            body=json.dumps(message)
+            body=message_data,
+            properties=publish_properties
         )
         connection.close()
-        logging.info(f"Published TranslationCompleted event for file_id: {file_id}")
+        logging.info(f"Published TranslationCompleted event for file_id: {file_id}" +
+                   (" (compressed)" if is_compressed else ""))
         
     except Exception as e:
         logging.error(f"Error in callback: {str(e)}")

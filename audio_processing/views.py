@@ -4,8 +4,11 @@ import json
 import pika
 import time
 import logging
+import threading
+import zlib
+import base64
 from django.conf import settings
-from django.http import JsonResponse
+from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.core.files.storage import default_storage
 from django.core.cache import cache
@@ -16,6 +19,22 @@ from .models import AudioProcessingTask
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 RATE_LIMIT_REQUESTS = 10
 RATE_LIMIT_WINDOW = 60  # 1 minute
+STREAMING_POLL_INTERVAL = 1  # Seconds to wait between status checks for streaming responses
+COMPRESSION_THRESHOLD = 1024  # Compress messages larger than 1KB
+USE_MESSAGE_COMPRESSION = True  # Enable/disable message compression
+
+def compress_message(message):
+    """Compress a message using zlib if it's larger than threshold"""
+    if not USE_MESSAGE_COMPRESSION:
+        return message, False
+        
+    message_bytes = message.encode('utf-8')
+    if len(message_bytes) < COMPRESSION_THRESHOLD:
+        return message, False
+        
+    compressed = zlib.compress(message_bytes)
+    b64_compressed = base64.b64encode(compressed).decode('ascii')
+    return b64_compressed, True
 
 def validate_audio_file(file):
     """Validate audio file size and format"""
@@ -70,17 +89,33 @@ def publish_event(event_type, payload):
                 priority = 3
             logging.info(f"Setting message priority to {priority} for file size {file_size/1024/1024:.2f}MB")
         
-        # Publish message with priority if available
-        properties = pika.BasicProperties(priority=priority) if priority else None
+        # Serialize and potentially compress the message
+        message_json = json.dumps(payload)
+        message_data, is_compressed = compress_message(message_json)
         
+        # Set message properties
+        message_props = {
+            'delivery_mode': 2,  # Make message persistent
+        }
+        
+        if priority is not None:
+            message_props['priority'] = priority
+            
+        if is_compressed:
+            message_props['content_encoding'] = 'zlib+base64'
+            logging.info(f"Message compressed: {len(message_json)} -> {len(message_data)} bytes")
+        
+        properties = pika.BasicProperties(**message_props)
+        
+        # Publish message with properties
         channel.basic_publish(
             exchange=settings.RABBITMQ_EXCHANGE,
             routing_key='',
-            body=json.dumps(payload),
+            body=message_data,
             properties=properties
         )
         connection.close()
-        logging.info(f"Published {event_type} event")
+        logging.info(f"Published {event_type} event" + (" (compressed)" if is_compressed else ""))
         
     except Exception as e:
         logging.error(f"Error publishing event: {str(e)}")
@@ -95,6 +130,62 @@ def cleanup_audio_file(file_path):
     except Exception as e:
         logging.error(f"Error cleaning up file: {str(e)}")
 
+def stream_processing_status(file_id):
+    """Generator function to stream processing status updates"""
+    # Initial response
+    yield json.dumps({
+        'status': 'processing_started',
+        'file_id': file_id,
+        'message': 'Your audio file is now being processed'
+    }) + '\n'
+    
+    max_attempts = 60  # Maximum 1 minute of streaming (with 1-second intervals)
+    attempts = 0
+    last_status = None
+    
+    while attempts < max_attempts:
+        try:
+            # Get current status
+            task = AudioProcessingTask.objects.get(file_id=file_id)
+            current_status = task.status
+            
+            # Only yield if status changed
+            if current_status != last_status:
+                if current_status == 'completed':
+                    yield json.dumps({
+                        'status': 'completed',
+                        'file_id': file_id,
+                        'translation': task.translation,
+                        'message': 'Processing completed successfully'
+                    }) + '\n'
+                    break
+                else:
+                    yield json.dumps({
+                        'status': current_status,
+                        'file_id': file_id,
+                        'message': f'Processing status: {current_status}'
+                    }) + '\n'
+                    last_status = current_status
+                    
+        except AudioProcessingTask.DoesNotExist:
+            yield json.dumps({
+                'status': 'error',
+                'message': 'Task not found'
+            }) + '\n'
+            break
+            
+        # Wait before checking again
+        time.sleep(STREAMING_POLL_INTERVAL)
+        attempts += 1
+    
+    # If we reached max attempts, inform the client
+    if attempts >= max_attempts:
+        yield json.dumps({
+            'status': 'timeout',
+            'file_id': file_id,
+            'message': 'Status streaming timeout reached. Check /translation/ endpoint for final result.'
+        }) + '\n'
+
 @csrf_exempt
 def upload_audio(request):
     if request.method != 'POST':
@@ -108,6 +199,10 @@ def upload_audio(request):
     
     if 'audio' not in request.FILES:
         return JsonResponse({'error': 'No audio file provided'}, status=400)
+    
+    # Check if client accepts streaming response
+    use_streaming = request.META.get('HTTP_ACCEPT', '').find('text/event-stream') >= 0 or \
+                    request.GET.get('stream', 'false').lower() == 'true'
     
     audio_file = request.FILES['audio']
     
@@ -135,11 +230,21 @@ def upload_audio(request):
         })
         logging.info(f"Published AudioFileUploaded event for file_id: {file_id}")
         
-        return JsonResponse({
-            'status': 'accepted',
-            'file_id': file_id,
-            'message': 'File uploaded successfully and processing has begun'
-        }, status=202)
+        # Return streaming or standard response based on client capability
+        if use_streaming:
+            response = StreamingHttpResponse(
+                streaming_content=stream_processing_status(file_id),
+                content_type='text/event-stream'
+            )
+            response['Cache-Control'] = 'no-cache'
+            response['X-Accel-Buffering'] = 'no'  # Disable Nginx buffering
+            return response
+        else:
+            return JsonResponse({
+                'status': 'accepted',
+                'file_id': file_id,
+                'message': 'File uploaded successfully and processing has begun'
+            }, status=202)
         
     except ValidationError as e:
         return JsonResponse({'error': str(e)}, status=400)
@@ -151,6 +256,21 @@ def upload_audio(request):
 
 def translation_status(request):
     try:
+        # Check if client wants streaming updates
+        stream_updates = request.GET.get('stream', 'false').lower() == 'true'
+        
+        # If streaming is requested and a file_id is provided, stream updates
+        file_id = request.GET.get('file_id')
+        if stream_updates and file_id:
+            response = StreamingHttpResponse(
+                streaming_content=stream_processing_status(file_id),
+                content_type='text/event-stream'
+            )
+            response['Cache-Control'] = 'no-cache'
+            response['X-Accel-Buffering'] = 'no'
+            return response
+        
+        # Standard non-streaming response
         latest_task = AudioProcessingTask.objects.latest('created_at')
         
         response = {

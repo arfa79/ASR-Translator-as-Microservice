@@ -8,6 +8,8 @@ import threading
 import concurrent.futures
 import tempfile
 import subprocess
+import zlib
+import base64
 from vosk import Model, KaldiRecognizer
 import wave
 
@@ -37,10 +39,39 @@ LARGE_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 MAX_WORKERS = 4  # Maximum number of parallel workers
 SEGMENT_DURATION = 30  # Segment duration in seconds for parallel processing
 CPU_AFFINITY_ENABLED = os.environ.get('CPU_AFFINITY_ENABLED', 'True').lower() in ('true', '1', 't')
+USE_MESSAGE_COMPRESSION = True  # Enable/disable message compression
+COMPRESSION_THRESHOLD = 1024  # Compress messages larger than 1KB
 
 # Global model cache
 global_model = None
 model_lock = threading.Lock()
+
+def decompress_message(message, content_encoding=None):
+    """Decompress a message if it's compressed"""
+    if not content_encoding or 'zlib+base64' not in content_encoding:
+        return message
+        
+    try:
+        # Decode base64, then decompress
+        decoded = base64.b64decode(message)
+        decompressed = zlib.decompress(decoded)
+        return decompressed.decode('utf-8')
+    except Exception as e:
+        logging.error(f"Error decompressing message: {str(e)}")
+        return message
+
+def compress_message(message):
+    """Compress a message using zlib if it's larger than threshold"""
+    if not USE_MESSAGE_COMPRESSION:
+        return message, False
+        
+    message_bytes = message.encode('utf-8')
+    if len(message_bytes) < COMPRESSION_THRESHOLD:
+        return message, False
+        
+    compressed = zlib.compress(message_bytes)
+    b64_compressed = base64.b64encode(compressed).decode('ascii')
+    return b64_compressed, True
 
 def set_cpu_affinity():
     """Set CPU affinity for the ASR service if psutil is available"""
@@ -343,7 +374,14 @@ def process_audio(file_path):
 def callback(ch, method, properties, body):
     """Handle incoming AudioFileUploaded events"""
     try:
-        message = json.loads(body)
+        # Handle compressed messages
+        content_encoding = properties.content_encoding if properties else None
+        if content_encoding and 'zlib+base64' in content_encoding:
+            body_str = decompress_message(body.decode('ascii'), content_encoding)
+            message = json.loads(body_str)
+            logging.info("Received compressed message")
+        else:
+            message = json.loads(body)
         
         if message['event_type'] != 'AudioFileUploaded':
             return
@@ -371,25 +409,41 @@ def callback(ch, method, properties, body):
         )
         channel = connection.channel()
         
-        message = {
+        result_message = {
             'event_type': 'TranscriptionGenerated',
             'file_id': file_id,
             'text': text
         }
         
+        # Serialize and potentially compress the message
+        message_json = json.dumps(result_message)
+        message_data, is_compressed = compress_message(message_json)
+        
+        # Set message properties
+        message_props = {
+            'delivery_mode': 2,  # Make message persistent
+        }
+        
         # Preserve original message priority
-        publish_properties = None
         if message_priority:
-            publish_properties = pika.BasicProperties(priority=message_priority)
+            message_props['priority'] = message_priority
+            
+        if is_compressed:
+            message_props['content_encoding'] = 'zlib+base64'
+            logging.info(f"Message compressed: {len(message_json)} -> {len(message_data)} bytes")
+        
+        publish_properties = pika.BasicProperties(**message_props)
         
         channel.basic_publish(
             exchange=settings.RABBITMQ_EXCHANGE,
             routing_key='',
-            body=json.dumps(message),
+            body=message_data,
             properties=publish_properties
         )
+        
         connection.close()
-        logging.info(f"Published TranscriptionGenerated event for file_id: {file_id}")
+        logging.info(f"Published TranscriptionGenerated event for file_id: {file_id}" + 
+                    (" (compressed)" if is_compressed else ""))
         
     except Exception as e:
         logging.error(f"Error in callback: {str(e)}")
