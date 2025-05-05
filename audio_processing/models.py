@@ -1,5 +1,5 @@
 import os
-from django.db import models
+from django.db import models, transaction
 from django.db.models.signals import pre_delete
 from django.dispatch import receiver
 from django.conf import settings
@@ -27,6 +27,30 @@ class AudioProcessingTaskQuerySet(models.QuerySet):
     def by_status(self, status):
         """Filter tasks by status with index usage"""
         return self.filter(status=status)
+    
+    def older_than(self, days):
+        """Get tasks older than specified days for cleanup"""
+        from django.utils import timezone
+        from datetime import timedelta
+        cutoff_date = timezone.now() - timedelta(days=days)
+        return self.filter(created_at__lt=cutoff_date)
+    
+    def bulk_update_status(self, status, file_ids=None):
+        """
+        Efficiently update status of multiple tasks in one database query
+        
+        Args:
+            status: New status to set
+            file_ids: Optional list of file IDs to filter, or all if None
+        """
+        qs = self
+        if file_ids is not None:
+            qs = qs.filter(file_id__in=file_ids)
+        
+        with transaction.atomic():
+            updated = qs.update(status=status)
+            logging.info(f"Bulk updated {updated} tasks to status '{status}'")
+            return updated
 
 
 class AudioProcessingTaskManager(models.Manager):
@@ -43,6 +67,32 @@ class AudioProcessingTaskManager(models.Manager):
     
     def by_status(self, status):
         return self.get_queryset().by_status(status)
+    
+    def older_than(self, days):
+        return self.get_queryset().older_than(days)
+    
+    def bulk_create_optimized(self, tasks_data):
+        """
+        Efficiently create multiple tasks in one database query
+        
+        Args:
+            tasks_data: List of dictionaries with task data
+        """
+        tasks = [self.model(**data) for data in tasks_data]
+        with transaction.atomic():
+            created = self.bulk_create(tasks)
+            logging.info(f"Bulk created {len(created)} tasks")
+            return created
+    
+    def bulk_update_status(self, status, file_ids=None):
+        """
+        Efficiently update status of multiple tasks
+        
+        Args:
+            status: New status to set
+            file_ids: Optional list of file IDs to filter, or all if None
+        """
+        return self.get_queryset().bulk_update_status(status, file_ids)
 
 
 class AudioProcessingTask(models.Model):
@@ -89,6 +139,20 @@ class AudioProcessingTask(models.Model):
     
     def __str__(self):
         return f"{self.file_id} - {self.get_status_display()}"
+    
+    @transaction.atomic
+    def update_status(self, new_status):
+        """
+        Update task status using atomic transaction
+        
+        Args:
+            new_status: The new status value
+        """
+        old_status = self.status
+        self.status = new_status
+        self.save(update_fields=['status', 'updated_at'])
+        logging.info(f"Task {self.file_id} status changed: {old_status} → {new_status}")
+        return self
 
 
 @receiver(pre_delete, sender=AudioProcessingTask)

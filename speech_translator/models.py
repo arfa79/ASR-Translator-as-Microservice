@@ -1,6 +1,12 @@
-from django.db import models
+from django.db import models, transaction
 from django.utils.translation import gettext_lazy as _
+from django.core.cache import cache
 import uuid
+import logging
+import hashlib
+
+# Get logger
+logger = logging.getLogger('speech_translator')
 
 
 class TranslationJobQuerySet(models.QuerySet):
@@ -43,6 +49,73 @@ class TranslationJobManager(models.Manager):
     
     def older_than(self, days):
         return self.get_queryset().older_than(days)
+    
+    def get_or_create_cached(self, source_text, source_lang='en', target_lang='fa'):
+        """
+        Get a cached translation or create a new job with caching
+        
+        Args:
+            source_text: Text to translate
+            source_lang: Source language code
+            target_lang: Target language code
+            
+        Returns:
+            tuple: (translation_job, created)
+        """
+        # Create a cache key based on source text and languages
+        cache_key = self._get_cache_key(source_text, source_lang, target_lang)
+        
+        # Try to get from cache first
+        cached_job_id = cache.get(cache_key)
+        if cached_job_id:
+            try:
+                return self.get(id=cached_job_id), False
+            except self.model.DoesNotExist:
+                # Job was deleted but cache entry remains
+                cache.delete(cache_key)
+        
+        # Check if we have a completed job for this text/language combo
+        try:
+            existing_job = self.filter(
+                source_text=source_text,
+                source_language=source_lang,
+                target_language=target_lang,
+                status='completed'
+            ).order_by('-created_at').first()
+            
+            if existing_job:
+                # Store in cache for future use (1 day TTL)
+                cache.set(cache_key, str(existing_job.id), 86400)
+                return existing_job, False
+        except Exception as e:
+            logger.warning(f"Error checking for existing translation: {str(e)}")
+        
+        # Create a new job
+        with transaction.atomic():
+            new_job = self.create(
+                source_text=source_text,
+                source_language=source_lang,
+                target_language=target_lang,
+                status='received'
+            )
+        
+        return new_job, True
+    
+    def _get_cache_key(self, source_text, source_lang, target_lang):
+        """
+        Generate a cache key for a translation
+        
+        Args:
+            source_text: Text to translate
+            source_lang: Source language code
+            target_lang: Target language code
+            
+        Returns:
+            str: Cache key
+        """
+        # Use MD5 hash of text for shorter keys
+        text_hash = hashlib.md5(source_text.encode('utf-8')).hexdigest()
+        return f"translation:{source_lang}:{target_lang}:{text_hash}"
 
 
 class TranslationJob(models.Model):
@@ -124,6 +197,10 @@ class TranslationJob(models.Model):
         blank=True,
         verbose_name=_('Processing Time (seconds)')
     )
+    cache_hits = models.IntegerField(
+        default=0,
+        verbose_name=_('Cache Hits')
+    )
     
     # Use optimized manager
     objects = TranslationJobManager()
@@ -146,3 +223,36 @@ class TranslationJob(models.Model):
             time_diff = self.updated_at - self.created_at
             self.processing_time = time_diff.total_seconds()
             self.save(update_fields=['processing_time'])
+    
+    @transaction.atomic
+    def update_status(self, new_status):
+        """
+        Update job status using atomic transaction
+        
+        Args:
+            new_status: The new status value
+        """
+        old_status = self.status
+        self.status = new_status
+        self.save(update_fields=['status', 'updated_at'])
+        logger.info(f"Job {self.id} status changed: {old_status} → {new_status}")
+        return self
+    
+    def cache_translation(self):
+        """Store this translation in cache for future use"""
+        if self.status == 'completed' and self.translated_text:
+            cache_key = TranslationJob.objects._get_cache_key(
+                self.source_text, 
+                self.source_language, 
+                self.target_language
+            )
+            # Cache for 30 days
+            cache.set(cache_key, str(self.id), 30 * 86400)
+            logger.debug(f"Cached translation {self.id} with key {cache_key}")
+            
+    def increment_cache_hit(self):
+        """Increment the counter for cache hits"""
+        self.cache_hits += 1
+        self.save(update_fields=['cache_hits'])
+        logger.debug(f"Translation {self.id} cache hit count: {self.cache_hits}")
+        return self.cache_hits

@@ -40,17 +40,41 @@ def translate_text(request):
                 code=ErrorCode.VALIDATION_ERROR
             )
         
-        # Create a translation job in the database with optimized query
-        with transaction.atomic():
-            translation_job = TranslationJob.objects.create(
-                source_text=text,
-                source_language=source_lang,
-                target_language=target_lang,
-                status=JobStatus.RECEIVED
-            )
+        # Try to get from cache or create a new job
+        translation_job, created = TranslationJob.objects.get_or_create_cached(
+            source_text=text,
+            source_lang=source_lang,
+            target_lang=target_lang
+        )
         
-        # In a real app, would send to message queue for processing
-        # For demo, we'll simulate immediate translation
+        # If we got a cached completed translation, return it immediately
+        if translation_job.status == JobStatus.COMPLETED and translation_job.translated_text:
+            # Increment cache hit counter in background
+            from django.db import connection
+            connection.close()  # Close DB connection first
+            
+            import threading
+            def increment_hit():
+                try:
+                    translation_job.increment_cache_hit()
+                except Exception as e:
+                    logger.error(f"Error incrementing cache hit: {str(e)}")
+                    
+            threading.Thread(target=increment_hit).start()
+            
+            # Return the cached translation
+            return APIResponse.success(
+                data={
+                    'original_text': translation_job.source_text,
+                    'translated_text': translation_job.translated_text,
+                    'job_id': str(translation_job.id),
+                    'status': translation_job.status,
+                    'source_language': translation_job.source_language,
+                    'target_language': translation_job.target_language,
+                    'cached': True
+                },
+                message="Translation retrieved from cache"
+            )
         
         # Log the translation request
         logger.info(f"Translation job {translation_job.id} received: {len(text)} characters")

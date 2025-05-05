@@ -352,8 +352,11 @@ def translation_status(request):
             response['X-Accel-Buffering'] = 'no'
             return response
         
-        # Standard non-streaming response
-        latest_task = AudioProcessingTask.objects.latest('created_at')
+        # Use optimized query method to get the latest task
+        latest_task = AudioProcessingTask.objects.recent().first()
+        
+        if not latest_task:
+            return JsonResponse({'status': 'No audio uploaded yet.'})
         
         # If task is completed, record end-to-end time if timer exists
         if latest_task.status == 'completed':
@@ -377,8 +380,6 @@ def translation_status(request):
             
         return JsonResponse(response)
         
-    except AudioProcessingTask.DoesNotExist:
-        return JsonResponse({'status': 'No audio uploaded yet.'})
     except Exception as e:
         logging.error(f"Error retrieving translation status: {str(e)}")
         record_error('audio_processing', 'status_error')
