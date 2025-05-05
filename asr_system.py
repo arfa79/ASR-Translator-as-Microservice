@@ -5,6 +5,9 @@ import django
 import time
 import logging
 import threading
+import concurrent.futures
+import tempfile
+import subprocess
 from vosk import Model, KaldiRecognizer
 import wave
 
@@ -21,6 +24,178 @@ django.setup()
 
 from django.conf import settings
 from audio_processing.models import AudioProcessingTask
+
+# Constants for processing
+LARGE_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
+MAX_WORKERS = 4  # Maximum number of parallel workers
+SEGMENT_DURATION = 30  # Segment duration in seconds for parallel processing
+
+def split_audio_file(file_path, segment_duration=SEGMENT_DURATION):
+    """Split a large audio file into smaller segments for parallel processing"""
+    logging.info(f"Splitting large audio file: {file_path}")
+    
+    try:
+        # Get file info
+        with wave.open(file_path, 'rb') as wf:
+            channels = wf.getnchannels()
+            sample_width = wf.getsampwidth()
+            framerate = wf.getframerate()
+            n_frames = wf.getnframes()
+            duration = n_frames / framerate
+        
+        logging.info(f"Audio file details: duration={duration:.2f}s, framerate={framerate}Hz, channels={channels}")
+        
+        # If file is small enough, don't split
+        if duration <= segment_duration:
+            logging.info("File is small enough to process as a single unit")
+            return [file_path]
+        
+        # Calculate number of segments
+        n_segments = int(duration / segment_duration) + (1 if duration % segment_duration > 0 else 0)
+        logging.info(f"Splitting into {n_segments} segments")
+        
+        # Extract filename without extension
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        
+        # Create temp directory for segments
+        temp_dir = tempfile.mkdtemp(prefix="asr_segments_")
+        segment_paths = []
+        
+        # Use ffmpeg to split the file
+        for i in range(n_segments):
+            start_time = i * segment_duration
+            output_file = os.path.join(temp_dir, f"{base_name}_segment_{i}.wav")
+            
+            # Use ffmpeg to extract segment
+            cmd = [
+                "ffmpeg",
+                "-i", file_path,
+                "-ss", str(start_time),
+                "-t", str(segment_duration),
+                "-acodec", "pcm_s16le",
+                "-ar", str(framerate),
+                "-ac", str(channels),
+                output_file,
+                "-y",  # Overwrite output file if it exists
+                "-loglevel", "error"  # Suppress ffmpeg output
+            ]
+            
+            subprocess.run(cmd, check=True)
+            segment_paths.append(output_file)
+            logging.info(f"Created segment {i+1}/{n_segments}: {output_file}")
+        
+        return segment_paths
+    
+    except Exception as e:
+        logging.error(f"Error splitting audio file: {str(e)}")
+        return [file_path]  # Fall back to original file
+
+def combine_transcription_results(results):
+    """Combine transcription results from multiple segments"""
+    combined = " ".join(filter(None, [r.strip() for r in results]))
+    return combined if combined else "No speech detected"
+
+def process_audio_segment(segment_path, model_path):
+    """Process a single audio segment - to be used in parallel processing"""
+    try:
+        model = Model(model_path)
+        wf = wave.open(segment_path, "rb")
+        sample_rate = wf.getframerate()
+        
+        recognizer = KaldiRecognizer(model, sample_rate)
+        recognizer.SetWords(True)
+        
+        text = ""
+        
+        while True:
+            data = wf.readframes(4000)
+            if len(data) == 0:
+                break
+            
+            if recognizer.AcceptWaveform(data):
+                result = json.loads(recognizer.Result())
+                if "text" in result and result["text"].strip():
+                    text += result["text"] + " "
+        
+        final_result = json.loads(recognizer.FinalResult())
+        if "text" in final_result and final_result["text"].strip():
+            text += final_result["text"]
+        
+        return text.strip()
+    
+    except Exception as e:
+        logging.error(f"Error processing segment {segment_path}: {str(e)}")
+        return ""
+
+def process_audio_parallel(file_path):
+    """Process audio file in parallel for larger files"""
+    model_path = "vosk-model-small-en-us-0.15"
+    
+    try:
+        # Check if model exists
+        if not os.path.exists(model_path):
+            logging.error(f"VOSK model not found at {model_path}")
+            raise FileNotFoundError(f"VOSK model not found at {model_path}")
+        
+        # Check file size
+        file_size = os.path.getsize(file_path)
+        
+        # For smaller files, use the standard processing
+        if file_size < LARGE_FILE_THRESHOLD:
+            logging.info(f"File size ({file_size} bytes) below threshold, using standard processing")
+            return process_audio(file_path)
+        
+        logging.info(f"Large file detected ({file_size} bytes), using parallel processing")
+        
+        # Split file into segments
+        segment_paths = split_audio_file(file_path)
+        
+        if len(segment_paths) == 1:
+            logging.info("Only one segment created, using standard processing")
+            return process_audio(file_path)
+        
+        # Process segments in parallel
+        logging.info(f"Processing {len(segment_paths)} segments in parallel with {MAX_WORKERS} workers")
+        results = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_segment = {
+                executor.submit(process_audio_segment, segment, model_path): segment 
+                for segment in segment_paths
+            }
+            
+            for i, future in enumerate(concurrent.futures.as_completed(future_to_segment)):
+                segment = future_to_segment[future]
+                try:
+                    result = future.result()
+                    logging.info(f"Completed segment {i+1}/{len(segment_paths)}: {os.path.basename(segment)}")
+                    results.append(result)
+                except Exception as e:
+                    logging.error(f"Error processing segment {segment}: {str(e)}")
+        
+        # Combine results
+        combined_text = combine_transcription_results(results)
+        logging.info(f"Combined transcription from {len(segment_paths)} segments: {combined_text[:100]}...")
+        
+        # Clean up temporary files if they were created
+        if segment_paths[0] != file_path:
+            for segment in segment_paths:
+                try:
+                    os.remove(segment)
+                except:
+                    pass
+            try:
+                os.rmdir(os.path.dirname(segment_paths[0]))
+            except:
+                pass
+        
+        return combined_text
+        
+    except Exception as e:
+        logging.error(f"Error in parallel processing: {str(e)}")
+        # Fall back to standard processing
+        logging.info("Falling back to standard processing")
+        return process_audio(file_path)
 
 def process_audio(file_path):
     """Perform ASR on the audio file using VOSK with streaming for faster processing"""
@@ -130,8 +305,8 @@ def callback(ch, method, properties, body):
         task.status = 'transcribing'
         task.save()
         
-        # Perform ASR
-        text = process_audio(file_path)
+        # Perform ASR - Use parallel processing for large files
+        text = process_audio_parallel(file_path)
         logging.info(f"Successfully transcribed audio for file_id: {file_id}")
         
         # Publish TranscriptionGenerated event
