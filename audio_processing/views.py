@@ -19,6 +19,10 @@ from asr_translator.metrics import (
     end_to_end_duration, update_task_counts, record_error
 )
 from django.db.models import Count
+from rest_framework.decorators import api_view
+from asr_translator.responses import APIResponse
+from asr_translator.statuses import ErrorCode, AudioStatus, Status
+from django.core.files.base import ContentFile
 
 # Constants
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
@@ -27,6 +31,9 @@ RATE_LIMIT_WINDOW = 60  # 1 minute
 STREAMING_POLL_INTERVAL = 1  # Seconds to wait between status checks for streaming responses
 COMPRESSION_THRESHOLD = 1024  # Compress messages larger than 1KB
 USE_MESSAGE_COMPRESSION = True  # Enable/disable message compression
+
+# Initialize logger
+logger = logging.getLogger('audio_processing')
 
 def compress_message(message):
     """Compress a message using zlib if it's larger than threshold"""
@@ -194,89 +201,140 @@ def stream_processing_status(file_id):
             'message': 'Status streaming timeout reached. Check /translation/ endpoint for final result.'
         }) + '\n'
 
-@csrf_exempt
+@api_view(['POST'])
 def upload_audio(request):
-    # Use a Timer to measure upload duration
-    with Timer(audio_upload_duration):
-        if request.method != 'POST':
-            return JsonResponse({'error': 'Only POST method is allowed'}, status=405)
+    """
+    Endpoint to upload audio files for processing
+    
+    Args:
+        request: The HTTP request containing audio file
         
-        # Check rate limit
-        if not check_rate_limit(request):
-            record_error('audio_processing', 'rate_limit_exceeded')
-            return JsonResponse({
-                'error': f'Rate limit exceeded. Maximum {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds'
-            }, status=429)
-        
-        if 'audio' not in request.FILES:
-            record_error('audio_processing', 'no_audio_file')
-            return JsonResponse({'error': 'No audio file provided'}, status=400)
-        
-        # Check if client accepts streaming response
-        use_streaming = request.META.get('HTTP_ACCEPT', '').find('text/event-stream') >= 0 or \
-                        request.GET.get('stream', 'false').lower() == 'true'
-        
-        audio_file = request.FILES['audio']
-        
-        try:
-            # Validate file
-            validate_audio_file(audio_file)
-            
-            file_id = str(uuid.uuid4())
-            file_path = os.path.join('uploads', f'{file_id}.wav')
-            
-            # Save the file
-            file_path = default_storage.save(file_path, audio_file)
-            abs_file_path = os.path.join(settings.MEDIA_ROOT, file_path)
-            
-            logging.info(f"Saved audio file: {abs_file_path}")
-            
-            # Create task record
-            AudioProcessingTask.objects.create(file_id=file_id)
-            logging.info(f"Created task record with file_id: {file_id}")
-            
-            # Record metrics
-            record_audio_upload(audio_file.size)
-            
-            # Update task count metrics
-            update_task_counts(dict(AudioProcessingTask.objects.values('status').annotate(count=Count('status')).values_list('status', 'count')))
-            
-            # Start end-to-end timer for this file
-            end_to_end_timer_key = f'e2e_timer_{file_id}'
-            cache.set(end_to_end_timer_key, time.time(), 3600)  # Store for up to an hour
-            
-            # Publish event
-            publish_event('AudioFileUploaded', {
-                'file_id': file_id,
-                'file_path': abs_file_path
+    Returns:
+        Response: Upload response or error
+    """
+    try:
+        # Check if file was uploaded
+        if 'file' not in request.FILES:
+            return APIResponse.validation_error({
+                'file': 'Audio file is required'
             })
-            logging.info(f"Published AudioFileUploaded event for file_id: {file_id}")
-            
-            # Return streaming or standard response based on client capability
-            if use_streaming:
-                response = StreamingHttpResponse(
-                    streaming_content=stream_processing_status(file_id),
-                    content_type='text/event-stream'
-                )
-                response['Cache-Control'] = 'no-cache'
-                response['X-Accel-Buffering'] = 'no'  # Disable Nginx buffering
-                return response
-            else:
-                return JsonResponse({
-                    'status': 'accepted',
-                    'file_id': file_id,
-                    'message': 'File uploaded successfully and processing has begun'
-                }, status=202)
-            
-        except ValidationError as e:
-            record_error('audio_processing', 'validation_error')
-            return JsonResponse({'error': str(e)}, status=400)
-        except Exception as e:
-            logging.error(f"Error processing upload: {str(e)}")
-            record_error('audio_processing', 'processing_error')
-            if 'abs_file_path' in locals():
-                cleanup_audio_file(abs_file_path)
-            return JsonResponse({'error': 'Internal server error'}, status=500)
+        
+        audio_file = request.FILES['file']
+        
+        # Check file size
+        if audio_file.size > settings.MAX_UPLOAD_SIZE:
+            return APIResponse.error(
+                message="File too large",
+                errors={"file": f"Maximum file size is {settings.MAX_UPLOAD_SIZE / (1024 * 1024)}MB"},
+                code=ErrorCode.FILE_TOO_LARGE,
+                status_code=413
+            )
+        
+        # Check file format
+        file_ext = os.path.splitext(audio_file.name)[1].lower()
+        if file_ext not in settings.ALLOWED_AUDIO_FORMATS:
+            return APIResponse.error(
+                message="Invalid file format",
+                errors={"file": f"Allowed formats: {', '.join(settings.ALLOWED_AUDIO_FORMATS)}"},
+                code=ErrorCode.INVALID_FILE_FORMAT
+            )
+        
+        # Generate unique file name
+        unique_filename = f"{uuid.uuid4()}{file_ext}"
+        file_path = os.path.join('uploads', unique_filename)
+        
+        # Save file
+        saved_path = default_storage.save(file_path, ContentFile(audio_file.read()))
+        
+        # Create job ID
+        job_id = str(uuid.uuid4())
+        
+        # Create job data
+        job_data = {
+            'status': AudioStatus.UPLOADED,
+            'file_path': saved_path,
+            'original_filename': audio_file.name,
+            'file_size': audio_file.size,
+            'transcription': None,
+            'translation': None,
+            'timestamp': None  # Will be set by worker
+        }
+        
+        # Store job data in cache
+        cache.set(f'audio_job_{job_id}', json.dumps(job_data), 86400)  # 24 hours TTL
+        
+        # Log the upload
+        logger.info(f"Audio file uploaded: {audio_file.name}, Size: {audio_file.size}, Job ID: {job_id}")
+        
+        # Return success response
+        return APIResponse.accepted(
+            message="Audio file uploaded successfully and processing has begun",
+            job_id=job_id
+        )
+    
+    except Exception as e:
+        logger.exception(f"Error processing audio upload: {str(e)}")
+        return APIResponse.server_error(exception=e)
+
+@api_view(['GET'])
+def audio_job_status(request, job_id):
+    """
+    Check the status of an audio processing job
+    
+    Args:
+        request: The HTTP request
+        job_id: The ID of the audio processing job
+        
+    Returns:
+        Response: Job status or error
+    """
+    try:
+        # Get job data from cache
+        job_data_str = cache.get(f'audio_job_{job_id}')
+        
+        if not job_data_str:
+            return APIResponse.not_found(
+                message=f"Audio processing job {job_id} not found",
+                resource_type="Audio job"
+            )
+        
+        job_data = json.loads(job_data_str)
+        
+        # Check if job is completed
+        if job_data['status'] == AudioStatus.COMPLETED:
+            return APIResponse.success(
+                data={
+                    'job_id': job_id,
+                    'status': job_data['status'],
+                    'filename': job_data['original_filename'],
+                    'transcription': job_data['transcription'],
+                    'translation': job_data['translation']
+                },
+                message="Audio processing completed"
+            )
+        
+        # Check if job failed
+        if job_data['status'] == AudioStatus.FAILED:
+            return APIResponse.error(
+                message="Audio processing failed",
+                errors={"job": "Processing could not be completed"},
+                code=ErrorCode.AUDIO_PROCESSING_FAILED,
+                status_code=500
+            )
+        
+        # Job is still in progress
+        return APIResponse.success(
+            data={
+                'job_id': job_id,
+                'status': job_data['status'],
+                'filename': job_data['original_filename']
+            },
+            message=f"Audio processing status: {job_data['status']}"
+        )
+    
+    except Exception as e:
+        logger.exception(f"Error checking audio job status: {str(e)}")
+        return APIResponse.server_error(exception=e)
 
 def translation_status(request):
     try:

@@ -18,8 +18,17 @@ from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
+from .views import metrics_endpoint, health_check
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('', include('audio_processing.urls')),
-] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+    path('api/audio/', include('audio_processing.urls')),
+    path('api/translate/', include('speech_translator.urls')),
+    path('metrics/', metrics_endpoint, name='metrics'),
+    path('health/', health_check, name='health_check'),
+]
+
+# Add static and media URLs in development
+if settings.DEBUG:
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

@@ -203,6 +203,9 @@ CPU_HIGH_THRESHOLD = float(os.environ.get('CPU_HIGH_THRESHOLD', '70.0'))
 CPU_LOW_THRESHOLD = float(os.environ.get('CPU_LOW_THRESHOLD', '20.0'))
 PROCESSING_TIME_THRESHOLD = float(os.environ.get('PROCESSING_TIME_THRESHOLD', '30.0'))
 
+# Metrics and monitoring settings
+METRICS_TOKEN = os.environ.get('METRICS_TOKEN', 'change-me-in-production')
+
 # Logging Configuration
 # Create logs directory if it doesn't exist
 LOGS_DIR = os.path.join(BASE_DIR, 'logs')

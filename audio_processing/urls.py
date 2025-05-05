@@ -2,6 +2,6 @@ from django.urls import path
 from . import views
 
 urlpatterns = [
-    path('upload/', views.upload_audio, name='upload_audio'),
-    path('translation/', views.translation_status, name='translation_status'),
+    path('', views.upload_audio, name='upload_audio'),
+    path('job/<str:job_id>/', views.audio_job_status, name='audio_job_status'),
 ]
