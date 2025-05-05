@@ -17,6 +17,8 @@ All components communicate asynchronously through RabbitMQ events.
 - Python 3.11+
 - RabbitMQ Server
 - VOSK English model (vosk-model-small-en-us-0.15)
+- Docker 
+- Prometheus & Grafana
 
 ## Installation
 
@@ -38,7 +40,7 @@ pip install -r requirements.txt
 ```
 
 4. Download VOSK model:
-   - Download [vosk-model-small-en-us-0.15](https://alphacephei.com/vosk/models)
+   - Download [vosk-model-small-en-us-0.15](https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip)
    - Extract it to the project root directory
 
 5. Set up RabbitMQ:
@@ -69,6 +71,34 @@ python asr_system.py
 3. Translation Service:
 ```bash
 python translator_agent.py
+```
+
+4. (Optional) Run with metrics collection and autoscaling:
+```bash
+# Verify dependencies and configure autoscaling
+./setup_autoscaling.sh
+
+# Run the integrated system
+python -m asr_translator.main
+```
+
+## Testing
+
+The system includes a comprehensive testing suite in the `tests/` directory:
+
+1. To test the VOSK speech recognition model:
+```bash
+python tests/test_vosk.py --audio path/to/audio.wav
+```
+
+2. To test the complete system end-to-end:
+```bash
+python tests/test_system.py path/to/audio.wav
+```
+
+3. To run all tests automatically:
+```bash
+./tests/run_tests.sh
 ```
 
 ## Usage
@@ -111,17 +141,9 @@ or
 }
 ```
 
-### Testing
-
-A test script is provided to verify system functionality:
-
-```bash
-cd tests
-sh run_tests.sh
-```
-
 ## Features
 
+### Core Features
 - Asynchronous processing using event-driven architecture
 - Automatic file cleanup after processing
 - Health monitoring for both services
@@ -129,6 +151,77 @@ sh run_tests.sh
 - Comprehensive error handling and logging
 - Support for WAV audio files
 - Automatic retry logic for service connections
+
+### Performance Optimizations
+- **Streaming Processing**: ASR processing in chunks for immediate feedback
+- **Parallel Processing**: Large audio files split into segments and processed concurrently
+- **Model Caching**: VOSK models loaded once and kept in memory
+- **Translation Caching**: Redis-based caching for translations to avoid redundant work
+- **Message Priorities**: RabbitMQ message priorities based on file size
+- **CPU Affinity Settings**: Services assigned to specific CPU cores
+- **Message Compression**: zlib compression for RabbitMQ messages
+- **HTTP Streaming Responses**: Real-time updates to clients
+
+### Performance Monitoring
+The system includes a built-in metrics collection system using Prometheus:
+
+1. **Setup Monitoring Stack**:
+```bash
+./monitoring/setup_monitoring.sh
+cd monitoring
+docker-compose up -d
+```
+
+2. **Available Metrics**:
+   - Request Rates: Audio uploads, ASR requests, and translations
+   - Processing Times: Duration measurements for each step
+   - Resource Usage: Memory and CPU monitoring
+   - Queue Sizes: RabbitMQ queue monitoring
+   - Cache Hit Ratio: Translation cache performance
+
+3. **Access Dashboards**:
+   - Prometheus: http://localhost:9090
+   - Grafana: http://localhost:3000 (login with admin/admin)
+
+### Autoscaling
+The system can dynamically scale based on workload metrics:
+
+1. **Setup Autoscaling**:
+```bash
+# Verify dependencies and configure autoscaling
+./setup_autoscaling.sh
+
+# Enable autoscaling
+export ENABLE_AUTOSCALING=True
+```
+
+2. **Scaling Logic**:
+   - Scales up when queue sizes exceed thresholds
+   - Scales up when CPU usage is too high
+   - Scales up when processing times are too long
+   - Scales down during low load periods
+
+3. **Configuration**: Customize thresholds via environment variables
+```bash
+export QUEUE_HIGH_THRESHOLD=10
+export CPU_HIGH_THRESHOLD=70.0
+export PROCESSING_TIME_THRESHOLD=30.0
+```
+
+## Dependencies
+
+The project uses dependencies with specific versions as defined in `requirements.txt`:
+
+- **Web Framework**: Django==5.2, djangorestframework==3.14.0
+- **Speech Recognition**: vosk==0.3.45, SoundFile==0.10.3.post1
+- **Translation**: argostranslate==1.9.6
+- **Messaging**: pika==1.3.2 (RabbitMQ client)
+- **Caching**: redis==5.0.0
+- **Monitoring**: prometheus_client==0.17.1, psutil==5.9.6
+- **Audio Processing**: pydub==0.25.1
+- **HTTP**: requests==2.32.3
+
+All dependencies use pinned versions to ensure consistent behavior across environments.
 
 ## Limitations
 
@@ -163,3 +256,5 @@ This project is licensed under the GNU General Public License v3.0 - see the [LI
 - [Argostranslate](https://www.argosopentech.com/) for translation
 - [RabbitMQ](https://www.rabbitmq.com/) for message queuing
 - [Django](https://www.djangoproject.com/) for the web framework
+- [Prometheus](https://prometheus.io/) for metrics collection
+- [Grafana](https://grafana.com/) for metrics visualization
