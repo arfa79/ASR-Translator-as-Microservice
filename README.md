@@ -19,6 +19,8 @@ All components communicate asynchronously through RabbitMQ events.
 - VOSK English model (vosk-model-small-en-us-0.15)
 - Docker 
 - Prometheus & Grafana
+- PostgreSQL (recommended) or SQLite
+- Redis (for caching)
 
 ## Installation
 
@@ -39,16 +41,47 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-4. Download VOSK model:
+4. Set up environment variables:
+```bash
+# Generate a .env file with secure settings
+python generate_env.py
+
+# Or create .env manually with necessary settings:
+# SECRET_KEY, DB_* settings, etc.
+```
+
+5. Set up PostgreSQL:
+```bash
+# Install PostgreSQL if not already installed
+# On Ubuntu/Debian:
+sudo apt install postgresql postgresql-contrib
+
+# Create database
+sudo -u postgres createdb asr_translator
+
+# Or use the database settings you specified in the .env file
+```
+
+6. Download VOSK model:
    - Download [vosk-model-small-en-us-0.15](https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip)
    - Extract it to the project root directory
 
-5. Set up RabbitMQ:
+7. Set up RabbitMQ:
    - Install [Erlang](https://www.erlang.org/downloads)
    - Install [RabbitMQ Server](https://www.rabbitmq.com/download.html)
    - Start RabbitMQ service
 
-6. Initialize Django:
+8. Set up Redis (optional, but recommended for caching):
+```bash
+# Install Redis if not already installed
+# On Ubuntu/Debian:
+sudo apt install redis-server
+
+# Start Redis
+sudo service redis-server start
+```
+
+9. Initialize Django:
 ```bash
 python manage.py migrate
 python manage.py createsuperuser  # Optional, for admin access
@@ -161,6 +194,7 @@ or
 - **CPU Affinity Settings**: Services assigned to specific CPU cores
 - **Message Compression**: zlib compression for RabbitMQ messages
 - **HTTP Streaming Responses**: Real-time updates to clients
+- **PostgreSQL Database**: High-performance database for production use
 
 ### Performance Monitoring
 The system includes a built-in metrics collection system using Prometheus:
@@ -216,12 +250,40 @@ The project uses dependencies with specific versions as defined in `requirements
 - **Speech Recognition**: vosk==0.3.45, SoundFile==0.10.3.post1
 - **Translation**: argostranslate==1.9.6
 - **Messaging**: pika==1.3.2 (RabbitMQ client)
-- **Caching**: redis==5.0.0
+- **Caching**: redis==5.0.0, django-redis==5.3.0
+- **Database**: psycopg2-binary==2.9.6 (PostgreSQL)
 - **Monitoring**: prometheus_client==0.17.1, psutil==5.9.6
 - **Audio Processing**: pydub==0.25.1
 - **HTTP**: requests==2.32.3
+- **Environment**: python-dotenv==1.0.0
 
 All dependencies use pinned versions to ensure consistent behavior across environments.
+
+## Configuration
+
+The application uses environment variables for configuration. Create a `.env` file in the project root:
+
+```
+# Django settings
+SECRET_KEY=your-secret-key-here
+DEBUG=True
+ALLOWED_HOSTS=localhost,127.0.0.1
+
+# Database settings
+DB_ENGINE=django.db.backends.postgresql
+DB_NAME=asr_translator
+DB_USER=postgres
+DB_PASSWORD=your-password-here
+DB_HOST=localhost
+DB_PORT=5432
+
+# Other settings...
+```
+
+You can generate a complete `.env` file with secure values by running:
+```bash
+python generate_env.py
+```
 
 ## Limitations
 
@@ -258,3 +320,5 @@ This project is licensed under the GNU General Public License v3.0 - see the [LI
 - [Django](https://www.djangoproject.com/) for the web framework
 - [Prometheus](https://prometheus.io/) for metrics collection
 - [Grafana](https://grafana.com/) for metrics visualization
+- [PostgreSQL](https://www.postgresql.org/) for database
+- [Redis](https://redis.io/) for caching
