@@ -1,11 +1,11 @@
-from django.shortcuts import render
+from django.shortcuts import render, get_object_or_404
 from rest_framework.decorators import api_view
 from asr_translator.responses import APIResponse
 from asr_translator.statuses import ErrorCode, JobStatus, Status
+from .models import TranslationJob
 import logging
-import uuid
-import json
-from django.core.cache import cache
+from django.db import transaction
+from django.utils import timezone
 
 # Get logger
 logger = logging.getLogger('speech_translator')
@@ -24,6 +24,8 @@ def translate_text(request):
     try:
         # Extract text from request data
         text = request.data.get('text')
+        source_lang = request.data.get('source_language', 'en')
+        target_lang = request.data.get('target_language', 'fa')
         
         if not text:
             return APIResponse.validation_error({
@@ -38,30 +40,25 @@ def translate_text(request):
                 code=ErrorCode.VALIDATION_ERROR
             )
         
-        # Generate a unique job ID
-        job_id = str(uuid.uuid4())
-        
-        # Store job in cache with initial status
-        job_data = {
-            'status': JobStatus.RECEIVED,
-            'text': text,
-            'result': None,
-            'timestamp': None  # Will be set by worker
-        }
-        
-        # Set cache with job data and TTL of 24 hours (in seconds)
-        cache.set(f'translation_job_{job_id}', json.dumps(job_data), 86400)
+        # Create a translation job in the database with optimized query
+        with transaction.atomic():
+            translation_job = TranslationJob.objects.create(
+                source_text=text,
+                source_language=source_lang,
+                target_language=target_lang,
+                status=JobStatus.RECEIVED
+            )
         
         # In a real app, would send to message queue for processing
         # For demo, we'll simulate immediate translation
         
         # Log the translation request
-        logger.info(f"Translation job {job_id} received: {len(text)} characters")
+        logger.info(f"Translation job {translation_job.id} received: {len(text)} characters")
         
         # Return accepted response with job ID
         return APIResponse.accepted(
             message="Translation request accepted",
-            job_id=job_id
+            job_id=str(translation_job.id)
         )
     
     except Exception as e:
@@ -82,25 +79,21 @@ def translation_status(request, job_id):
         Response: Job status or error
     """
     try:
-        # Get job data from cache
-        job_data_str = cache.get(f'translation_job_{job_id}')
-        
-        if not job_data_str:
-            return APIResponse.not_found(
-                message=f"Translation job {job_id} not found",
-                resource_type="Translation job"
-            )
-        
-        job_data = json.loads(job_data_str)
+        # Get job from database with optimized query
+        # Using get_object_or_404 for cleaner code
+        translation_job = get_object_or_404(TranslationJob, id=job_id)
         
         # Check if job is completed
-        if job_data['status'] == JobStatus.COMPLETED:
+        if translation_job.status == JobStatus.COMPLETED:
             return APIResponse.success(
                 data={
-                    'original_text': job_data['text'],
-                    'translated_text': job_data['result'],
-                    'job_id': job_id,
-                    'status': job_data['status']
+                    'original_text': translation_job.source_text,
+                    'translated_text': translation_job.translated_text,
+                    'job_id': str(translation_job.id),
+                    'status': translation_job.status,
+                    'source_language': translation_job.source_language,
+                    'target_language': translation_job.target_language,
+                    'processing_time': translation_job.processing_time
                 },
                 message="Translation completed"
             )
@@ -108,10 +101,13 @@ def translation_status(request, job_id):
         # Job is still in progress
         return APIResponse.success(
             data={
-                'job_id': job_id,
-                'status': job_data['status']
+                'job_id': str(translation_job.id),
+                'status': translation_job.status,
+                'source_language': translation_job.source_language,
+                'target_language': translation_job.target_language,
+                'created_at': translation_job.created_at
             },
-            message=f"Translation status: {job_data['status']}"
+            message=f"Translation status: {translation_job.status}"
         )
     
     except Exception as e:
