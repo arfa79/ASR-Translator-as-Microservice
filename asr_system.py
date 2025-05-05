@@ -33,6 +33,10 @@ django.setup()
 
 from django.conf import settings
 from audio_processing.models import AudioProcessingTask
+from asr_translator.metrics import (
+    record_asr_request, asr_processing_duration, Timer, 
+    record_error, memory_usage, cpu_usage
+)
 
 # Constants for processing
 LARGE_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
@@ -58,6 +62,7 @@ def decompress_message(message, content_encoding=None):
         return decompressed.decode('utf-8')
     except Exception as e:
         logging.error(f"Error decompressing message: {str(e)}")
+        record_error('asr', 'decompression_error')
         return message
 
 def compress_message(message):
@@ -100,6 +105,7 @@ def set_cpu_affinity():
         logging.info(f"Set CPU affinity to cores: {cores_to_use}")
     except Exception as e:
         logging.error(f"Error setting CPU affinity: {str(e)}")
+        record_error('asr', 'cpu_affinity_error')
 
 def get_model(model_path="vosk-model-small-en-us-0.15"):
     """Get the ASR model, using a cached version if available"""
@@ -118,6 +124,7 @@ def get_model(model_path="vosk-model-small-en-us-0.15"):
         # Check if model exists
         if not os.path.exists(model_path):
             logging.error(f"VOSK model not found at {model_path}")
+            record_error('asr', 'model_not_found')
             raise FileNotFoundError(f"VOSK model not found at {model_path}")
         
         logging.info(f"Loading VOSK model from {model_path} (initial load)")
@@ -184,6 +191,7 @@ def split_audio_file(file_path, segment_duration=SEGMENT_DURATION):
     
     except Exception as e:
         logging.error(f"Error splitting audio file: {str(e)}")
+        record_error('asr', 'file_splitting_error')
         return [file_path]  # Fall back to original file
 
 def combine_transcription_results(results):
@@ -194,6 +202,12 @@ def combine_transcription_results(results):
 def process_audio_segment(segment_path, model_path):
     """Process a single audio segment - to be used in parallel processing"""
     try:
+        # Record memory usage before processing
+        if PSUTIL_AVAILABLE:
+            process = psutil.Process()
+            mem_before = process.memory_info().rss
+            memory_usage.labels(service='asr').set(mem_before)
+        
         # Use the global model cache
         model = get_model(model_path)
         wf = wave.open(segment_path, "rb")
@@ -218,10 +232,17 @@ def process_audio_segment(segment_path, model_path):
         if "text" in final_result and final_result["text"].strip():
             text += final_result["text"]
         
+        # Record memory usage after processing
+        if PSUTIL_AVAILABLE:
+            mem_after = process.memory_info().rss
+            memory_usage.labels(service='asr').set(mem_after)
+            logging.info(f"Memory usage for segment {os.path.basename(segment_path)}: {(mem_after-mem_before)/1024/1024:.2f}MB")
+        
         return text.strip()
     
     except Exception as e:
         logging.error(f"Error processing segment {segment_path}: {str(e)}")
+        record_error('asr', 'segment_processing_error')
         return ""
 
 def process_audio_parallel(file_path):
@@ -264,6 +285,7 @@ def process_audio_parallel(file_path):
                     results.append(result)
                 except Exception as e:
                     logging.error(f"Error processing segment {segment}: {str(e)}")
+                    record_error('asr', 'parallel_processing_error')
         
         # Combine results
         combined_text = combine_transcription_results(results)
@@ -285,6 +307,7 @@ def process_audio_parallel(file_path):
         
     except Exception as e:
         logging.error(f"Error in parallel processing: {str(e)}")
+        record_error('asr', 'parallel_processing_error')
         # Fall back to standard processing
         logging.info("Falling back to standard processing")
         return process_audio(file_path)
@@ -324,12 +347,22 @@ def process_audio(file_path):
             chunk_count = 0
             current_text = ""
             
+            # Record CPU usage during processing
+            if PSUTIL_AVAILABLE:
+                process = psutil.Process()
+            
             while True:
                 data = wf.readframes(chunk_size)
                 if len(data) == 0:
                     break
                 
                 chunk_count += 1
+                
+                # Record CPU usage periodically
+                if PSUTIL_AVAILABLE and chunk_count % 10 == 0:
+                    cpu_percent = process.cpu_percent(interval=0.1)
+                    cpu_usage.labels(service='asr').set(cpu_percent)
+                
                 try:
                     if recognizer.AcceptWaveform(data):
                         result = json.loads(recognizer.Result())
@@ -340,6 +373,7 @@ def process_audio(file_path):
                             text += current_text + " "
                 except Exception as e:
                     logging.error(f"Error processing frame {chunk_count}: {str(e)}")
+                    record_error('asr', 'frame_processing_error')
                     continue
             
             # Get final result for any remaining audio
@@ -360,20 +394,26 @@ def process_audio(file_path):
             
         except Exception as e:
             logging.error(f"Error during frame processing: {str(e)}")
+            record_error('asr', 'frame_processing_error')
             # Fallback: return a message that we couldn't process the audio
             return "Audio processing failed due to technical issues"
         
     except FileNotFoundError as e:
         logging.error(f"Model not found error: {str(e)}")
+        record_error('asr', 'model_not_found')
         raise
     except Exception as e:
         logging.error(f"Error processing audio file: {str(e)}")
+        record_error('asr', 'audio_processing_error')
         # Don't raise the exception, return a fallback message instead
         return "Audio processing failed due to technical issues"
 
 def callback(ch, method, properties, body):
     """Handle incoming AudioFileUploaded events"""
     try:
+        # Record ASR request
+        record_asr_request()
+        
         # Handle compressed messages
         content_encoding = properties.content_encoding if properties else None
         if content_encoding and 'zlib+base64' in content_encoding:
@@ -399,8 +439,11 @@ def callback(ch, method, properties, body):
         task.status = 'transcribing'
         task.save()
         
-        # Perform ASR - Use parallel processing for large files
-        text = process_audio_parallel(file_path)
+        # Use Timer to measure ASR processing duration
+        with Timer(asr_processing_duration):
+            # Perform ASR - Use parallel processing for large files
+            text = process_audio_parallel(file_path)
+        
         logging.info(f"Successfully transcribed audio for file_id: {file_id}")
         
         # Publish TranscriptionGenerated event
@@ -447,6 +490,7 @@ def callback(ch, method, properties, body):
         
     except Exception as e:
         logging.error(f"Error in callback: {str(e)}")
+        record_error('asr', 'callback_error')
         raise
 
 def get_rabbitmq_connection():
@@ -471,6 +515,7 @@ def get_rabbitmq_connection():
                 print("1. RabbitMQ server is installed")
                 print("2. RabbitMQ service is running")
                 print("3. RabbitMQ is accessible at localhost:5672")
+                record_error('asr', 'rabbitmq_connection_failed')
                 raise
 
 def check_health():
@@ -494,14 +539,23 @@ def check_health():
                 logging.info("Health check: VOSK model OK (cached)")
             except Exception as e:
                 logging.warning(f"Health check: VOSK model issue: {str(e)}")
+                record_error('asr', 'health_check_model_error')
                 
         except Exception as e:
             logging.error(f"Health check failed: {str(e)}")
+            record_error('asr', 'health_check_error')
         
         time.sleep(300)  # Check every 5 minutes
 
 def main():
     try:
+        # Set service name for metrics
+        os.environ['SERVICE_NAME'] = 'asr'
+        
+        # Start metrics collection
+        from asr_translator.metrics import start_metrics_collection
+        metrics_thread = start_metrics_collection()
+        
         # Set CPU affinity for better performance
         set_cpu_affinity()
         
@@ -511,6 +565,7 @@ def main():
             print("VOSK model preloaded successfully!")
         except Exception as e:
             print(f"Warning: Failed to preload VOSK model: {str(e)}")
+            record_error('asr', 'model_preload_error')
         
         # Start health check in background thread
         health_thread = threading.Thread(target=check_health, daemon=True)
@@ -550,6 +605,7 @@ def main():
                 pass
     except Exception as e:
         print(f"Fatal error: {str(e)}")
+        record_error('asr', 'fatal_error')
         raise
 
 if __name__ == '__main__':

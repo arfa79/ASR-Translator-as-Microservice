@@ -31,6 +31,10 @@ django.setup()
 
 from django.conf import settings
 from audio_processing.models import AudioProcessingTask
+from asr_translator.metrics import (
+    record_translation_request, translation_duration, Timer,
+    record_error, memory_usage, cpu_usage, update_cache_hit_ratio
+)
 
 # Redis configuration
 REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')
@@ -54,6 +58,10 @@ if REDIS_ENABLED:
         logging.warning("Translation caching will be disabled")
         redis_client = None
 
+# Metrics for cache
+cache_hits = 0
+cache_misses = 0
+
 def decompress_message(message, content_encoding=None):
     """Decompress a message if it's compressed"""
     if not content_encoding or 'zlib+base64' not in content_encoding:
@@ -66,6 +74,7 @@ def decompress_message(message, content_encoding=None):
         return decompressed.decode('utf-8')
     except Exception as e:
         logging.error(f"Error decompressing message: {str(e)}")
+        record_error('translator', 'decompression_error')
         return message
 
 def compress_message(message):
@@ -108,6 +117,7 @@ def set_cpu_affinity():
         logging.info(f"Set CPU affinity to cores: {cores_to_use}")
     except Exception as e:
         logging.error(f"Error setting CPU affinity: {str(e)}")
+        record_error('translator', 'cpu_affinity_error')
 
 def setup_translation():
     """Setup Argostranslate with English to Persian translation"""
@@ -122,6 +132,7 @@ def setup_translation():
         
         if not package_to_install:
             logging.error("English to Persian translation package not found")
+            record_error('translator', 'translation_package_not_found')
             raise RuntimeError(
                 "English to Persian translation package not found. "
                 "Please check your internet connection and try again."
@@ -133,11 +144,16 @@ def setup_translation():
         
     except Exception as e:
         logging.error(f"Error setting up translation: {str(e)}")
+        record_error('translator', 'translation_setup_error')
         raise
 
 def get_cached_translation(text):
     """Get a cached translation if available"""
+    global cache_hits, cache_misses
+    
     if not redis_client:
+        cache_misses += 1
+        update_cache_hit_ratio(cache_hits, cache_misses)
         return None
     
     # Create a cache key based on the text
@@ -148,10 +164,15 @@ def get_cached_translation(text):
         if cached:
             translation = cached.decode('utf-8')
             logging.info(f"Cache hit for text: '{text[:30]}...'")
+            cache_hits += 1
+            update_cache_hit_ratio(cache_hits, cache_misses)
             return translation
     except Exception as e:
         logging.error(f"Redis cache retrieval error: {str(e)}")
+        record_error('translator', 'cache_retrieval_error')
     
+    cache_misses += 1
+    update_cache_hit_ratio(cache_hits, cache_misses)
     return None
 
 def cache_translation(text, translation):
@@ -167,6 +188,7 @@ def cache_translation(text, translation):
         logging.info(f"Cached translation for text: '{text[:30]}...'")
     except Exception as e:
         logging.error(f"Redis cache storage error: {str(e)}")
+        record_error('translator', 'cache_storage_error')
 
 def perform_translation(text):
     """Translate text from English to Persian using Argostranslate"""
@@ -175,11 +197,26 @@ def perform_translation(text):
     if cached_translation:
         return cached_translation
     
+    # Track memory usage before translation
+    if PSUTIL_AVAILABLE:
+        process = psutil.Process()
+        mem_before = process.memory_info().rss
+        memory_usage.labels(service='translator').set(mem_before)
+        
     # No cache hit, perform the translation
     logging.info("Cache miss, performing translation...")
-    installed_languages = translate.get_installed_languages()
-    translation_en_fa = installed_languages[0].get_translation(installed_languages[1])
-    translation = translation_en_fa.translate(text)
+    
+    # Use a Timer to measure translation duration
+    with Timer(translation_duration):
+        installed_languages = translate.get_installed_languages()
+        translation_en_fa = installed_languages[0].get_translation(installed_languages[1])
+        translation = translation_en_fa.translate(text)
+    
+    # Track memory usage after translation
+    if PSUTIL_AVAILABLE:
+        mem_after = process.memory_info().rss
+        memory_usage.labels(service='translator').set(mem_after)
+        logging.info(f"Memory usage for translation: {(mem_after-mem_before)/1024/1024:.2f}MB")
     
     # Cache the result for future use
     cache_translation(text, translation)
@@ -189,6 +226,9 @@ def perform_translation(text):
 def callback(ch, method, properties, body):
     """Handle incoming TranscriptionGenerated events"""
     try:
+        # Record translation request
+        record_translation_request()
+        
         # Handle compressed messages
         content_encoding = properties.content_encoding if properties else None
         if content_encoding and 'zlib+base64' in content_encoding:
@@ -212,6 +252,7 @@ def callback(ch, method, properties, body):
         # Check if we have a valid transcription to translate
         if not text or text in ["No speech detected", "Audio processing failed due to technical issues"]:
             logging.warning(f"Received invalid or empty transcription: '{text}'")
+            record_error('translator', 'invalid_transcription')
             # Update task with the error message
             task = AudioProcessingTask.objects.get(file_id=file_id)
             task.status = 'completed'
@@ -279,6 +320,7 @@ def callback(ch, method, properties, body):
         
     except Exception as e:
         logging.error(f"Error in callback: {str(e)}")
+        record_error('translator', 'callback_error')
         # Try to update the task with an error message
         try:
             if 'file_id' in locals():
@@ -289,6 +331,7 @@ def callback(ch, method, properties, body):
                 logging.info(f"Updated task with error message for file_id: {file_id}")
         except Exception as inner_e:
             logging.error(f"Error updating task with error status: {str(inner_e)}")
+            record_error('translator', 'task_update_error')
 
 def get_rabbitmq_connection():
     retries = 5
@@ -312,6 +355,7 @@ def get_rabbitmq_connection():
                 print("1. RabbitMQ server is installed")
                 print("2. RabbitMQ service is running")
                 print("3. RabbitMQ is accessible at localhost:5672")
+                record_error('translator', 'rabbitmq_connection_failed')
                 raise
 
 def check_health():
@@ -337,6 +381,7 @@ def check_health():
             )
             if not translation_pair:
                 logging.warning("Health check: English-Persian translation model not found")
+                record_error('translator', 'health_check_model_error')
             else:
                 logging.info("Health check: Translation model OK")
             
@@ -347,14 +392,23 @@ def check_health():
                     logging.info("Health check: Redis cache OK")
                 except Exception as e:
                     logging.warning(f"Health check: Redis cache error: {str(e)}")
+                    record_error('translator', 'health_check_redis_error')
                 
         except Exception as e:
             logging.error(f"Health check failed: {str(e)}")
+            record_error('translator', 'health_check_error')
         
         time.sleep(300)  # Check every 5 minutes
 
 def main():
     try:
+        # Set service name for metrics
+        os.environ['SERVICE_NAME'] = 'translator'
+        
+        # Start metrics collection
+        from asr_translator.metrics import start_metrics_collection
+        metrics_thread = start_metrics_collection()
+        
         # Set CPU affinity for better performance
         set_cpu_affinity()
         
@@ -399,6 +453,7 @@ def main():
                 pass
     except Exception as e:
         logging.error(f"Fatal error: {str(e)}")
+        record_error('translator', 'fatal_error')
         raise
 
 if __name__ == '__main__':
