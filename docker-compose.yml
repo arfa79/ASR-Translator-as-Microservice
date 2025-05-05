@@ -1,0 +1,208 @@
+version: '3.8'
+
+services:
+  # Main Django application
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    volumes:
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+      - ./logs:/app/logs
+    env_file:
+      - ./.env
+    depends_on:
+      - db
+      - redis
+      - rabbitmq
+    networks:
+      - asr_network
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ASR Worker
+  asr_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+      args:
+        SERVICE: asr
+    restart: unless-stopped
+    volumes:
+      - media_volume:/app/media
+      - ./models:/app/models
+      - ./logs:/app/logs
+    env_file:
+      - ./.env
+    environment:
+      - SERVICE_TYPE=asr
+      # Optional CPU affinity override (comma-separated list of CPU IDs)
+      # - CPU_AFFINITY=0,1
+    depends_on:
+      - rabbitmq
+      - redis
+    networks:
+      - asr_network
+    # Using reservation instead of hard limits to allow for application's internal resource management
+    deploy:
+      resources:
+        reservations:
+          cpus: '1'
+          memory: 2G
+        # Soft limits to avoid container restrictions conflicting with app's CPU affinity
+        limits:
+          cpus: '0'  # 0 means no limit, letting the app manage CPU
+          memory: 6G  # Increased memory limit to accommodate peak usage
+      replicas: 2
+
+  # Translator Worker
+  translator_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+      args:
+        SERVICE: translator
+    restart: unless-stopped
+    volumes:
+      - media_volume:/app/media
+      - ./models:/app/models
+      - ./logs:/app/logs
+    env_file:
+      - ./.env
+    environment:
+      - SERVICE_TYPE=translator
+      # Optional CPU affinity override (comma-separated list of CPU IDs)
+      # - CPU_AFFINITY=2,3
+    depends_on:
+      - rabbitmq
+      - redis
+    networks:
+      - asr_network
+    deploy:
+      resources:
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+        limits:
+          cpus: '0'
+          memory: 4G
+      replicas: 2
+
+  # PostgreSQL Database
+  db:
+    image: postgres:14-alpine
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    env_file:
+      - ./.env
+    environment:
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_DB=${DB_NAME}
+    networks:
+      - asr_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - asr_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # RabbitMQ Message Broker
+  rabbitmq:
+    image: rabbitmq:3.11-management
+    restart: unless-stopped
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    env_file:
+      - ./.env
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASSWORD}
+    ports:
+      - "15672:15672"  # Management UI
+    networks:
+      - asr_network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:v2.42.0
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    networks:
+      - asr_network
+    depends_on:
+      - web
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:9.4.7
+    restart: unless-stopped
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"
+    networks:
+      - asr_network
+    depends_on:
+      - prometheus
+
+# Volumes for persistent data
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  static_volume:
+  media_volume:
+  prometheus_data:
+  grafana_data:
+
+# Networks
+networks:
+  asr_network:
+    driver: bridge 

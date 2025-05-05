@@ -1,0 +1,75 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+
+# Database
+*.sqlite3
+*.db
+
+# Logs
+logs/
+*.log
+
+# Media files (will be mounted as volume)
+media/
+
+# Static files (will be collected during build)
+staticfiles/
+
+# Docker specific
+Dockerfile
+Dockerfile.*
+docker-compose.yml
+.dockerignore
+
+# Editor specific
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Tests and documentation
+tests/
+docs/
+README*.md
+LICENSE
+**/test_*.py
+
+# Environment variables
+.env
+.env.*
+env.example
+
+# Node.js
+node_modules/
+npm-debug.log
+
+# Models - we'll mount these as volumes
+models/
+
+# Temporary files
+*.tmp
+.DS_Store 

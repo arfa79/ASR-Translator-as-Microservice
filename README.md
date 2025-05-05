@@ -2,6 +2,22 @@
 
 A microservice-based system that performs Automatic Speech Recognition (ASR) on English audio files and translates the text to Persian. The system is built with Django and uses an Event-Driven Architecture (EDA) with RabbitMQ for communication between services.
 
+## Table of Contents
+- [System Architecture](#system-architecture)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+  - [Traditional Setup](#traditional-setup)
+  - [Docker Setup](#docker-setup)
+- [Running the System](#running-the-system)
+  - [Without Docker](#without-docker)
+  - [With Docker](#with-docker)
+- [Testing](#testing)
+- [Usage](#usage)
+- [Features](#features)
+- [Docker Deployment](#docker-deployment)
+- [Performance Tuning](#performance-tuning)
+- [Dependencies](#dependencies)
+
 ## System Architecture
 
 The system consists of three main components:
@@ -17,12 +33,14 @@ All components communicate asynchronously through RabbitMQ events.
 - Python 3.11+
 - RabbitMQ Server
 - VOSK English model (vosk-model-small-en-us-0.15)
-- Docker 
-- Prometheus & Grafana
+- Docker (optional, for containerized deployment)
+- Prometheus & Grafana (for monitoring)
 - PostgreSQL (recommended) or SQLite
 - Redis (for caching)
 
 ## Installation
+
+### Traditional Setup
 
 1. Clone the repository:
 ```bash
@@ -87,7 +105,27 @@ python manage.py migrate
 python manage.py createsuperuser  # Optional, for admin access
 ```
 
+### Docker Setup
+
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/ASR-Translator-as-Microservice.git
+cd ASR-Translator-as-Microservice
+```
+
+2. Create a `.env` file from the example template:
+```bash
+cp env.example .env
+```
+
+3. Edit the `.env` file to configure your environment:
+   - Update `SECRET_KEY` with a secure key
+   - Set database credentials
+   - Configure other settings as needed
+
 ## Running the System
+
+### Without Docker
 
 You need to run three components in separate terminals:
 
@@ -114,6 +152,24 @@ python translator_agent.py
 # Run the integrated system
 python -m asr_translator.main
 ```
+
+### With Docker
+
+1. Build and start all services:
+```bash
+docker-compose up -d
+```
+
+2. Check service status:
+```bash
+docker-compose ps
+```
+
+3. Access the application:
+   - Web API: http://localhost:8000/
+   - RabbitMQ Management: http://localhost:15672/ (username/password from .env)
+   - Prometheus: http://localhost:9090/
+   - Grafana: http://localhost:3000/ (default admin/admin)
 
 ## Testing
 
@@ -242,83 +298,194 @@ export CPU_HIGH_THRESHOLD=70.0
 export PROCESSING_TIME_THRESHOLD=30.0
 ```
 
+## Docker Deployment
+
+### Service Architecture
+
+The Docker setup includes the following services:
+
+1. **web**: Django API server for handling HTTP requests
+2. **asr_worker**: Speech recognition worker service using VOSK
+3. **translator_worker**: Text translation worker service using Argostranslate
+4. **db**: PostgreSQL database for persistent data storage
+5. **redis**: Redis cache for improved performance
+6. **rabbitmq**: Message broker for communication between services
+7. **prometheus**: Metrics collection for monitoring
+8. **grafana**: Visualization dashboard for metrics
+
+### Resource Management and CPU Affinity
+
+#### Container Resource Settings
+
+The Docker Compose configuration is designed to work with the application's internal CPU affinity and resource management:
+
+- **CPU Limits**: Set to zero (`cpus: '0'`) to allow the application to manage its own CPU allocation through CPU affinity settings.
+- **CPU Reservations**: Set minimum CPU resources that containers should have access to.
+- **Memory Limits**: Set higher than required to accommodate peak usage and prevent OOM kills.
+
+This approach allows the ASR and Translator services to:
+1. Run their internal CPU affinity optimizations without container interference
+2. Dynamically scale CPU usage based on workload
+3. Properly handle parallel processing of audio files
+
+#### Adjusting Resource Settings
+
+If you observe resource-related issues:
+
+1. Check application logs for affinity or resource errors
+2. Adjust the container settings in `docker-compose.yml` as follows:
+   - Increase memory limits if you see OOM errors
+   - Adjust CPU reservations based on host capacity
+   - Consider setting `cpus` limit if the application consumes too many resources
+
+#### CPU Pinning for Production
+
+For production deployments on multi-CPU systems, you may want to pin specific containers to specific CPUs to match the application's internal CPU affinity settings:
+
+```bash
+# Example: Run containers with specific CPU pinning (Docker run example)
+docker run --cpuset-cpus="0,1" --name asr_worker_1 your-asr-image
+```
+
+This ensures the application's internal CPU affinity matches the container's CPU allocation.
+
+### Scaling Docker Services
+
+To scale the worker services:
+
+```bash
+# Scale ASR workers to 3 instances
+docker-compose up -d --scale asr_worker=3
+
+# Scale translator workers to 2 instances
+docker-compose up -d --scale translator_worker=2
+```
+
+### Accessing Docker Logs
+
+```bash
+# View logs from all services
+docker-compose logs
+
+# View logs from a specific service
+docker-compose logs web
+
+# Follow logs in real-time
+docker-compose logs -f asr_worker
+```
+
+### Common Docker Tasks
+
+#### Database Migrations
+
+```bash
+docker-compose exec web python manage.py makemigrations
+docker-compose exec web python manage.py migrate
+```
+
+#### Creating a Superuser
+
+```bash
+docker-compose exec web python manage.py createsuperuser
+```
+
+#### Backing Up the Database
+
+```bash
+docker-compose exec db pg_dump -U postgres asr_translator > backup.sql
+```
+
+#### Restoring the Database
+
+```bash
+cat backup.sql | docker-compose exec -T db psql -U postgres asr_translator
+```
+
+### Stopping Docker Services
+
+```bash
+# Stop services but keep volumes and networks
+docker-compose down
+
+# Stop services and remove volumes (WARNING: This will delete all data)
+docker-compose down -v
+```
+
+### Docker Troubleshooting
+
+#### Container Won't Start
+
+Check logs for the failing container:
+
+```bash
+docker-compose logs [service-name]
+```
+
+#### Database Connection Issues
+
+Ensure PostgreSQL is running and the connection details in `.env` are correct:
+
+```bash
+docker-compose exec db psql -U postgres -c "SELECT 1"
+```
+
+#### Models Not Loading
+
+Check if models are correctly mounted in the volumes:
+
+```bash
+docker-compose exec asr_worker ls -la /app/models/vosk
+```
+
+#### Resource-Related Issues
+
+If you're experiencing issues related to CPU or memory:
+
+```bash
+# Check container resource usage
+docker stats
+
+# View container details including resource limits
+docker inspect asr_worker_1 | grep -A 20 "HostConfig"
+```
+
+### Docker Production Deployment Notes
+
+For production deployments:
+
+1. Use proper SSL/TLS termination with a reverse proxy like Nginx
+2. Set `DEBUG=False` in the .env file
+3. Use strong, unique passwords for all services
+4. Consider using Docker Swarm or Kubernetes for advanced orchestration
+5. Set up regular backups of the database and media files
+6. Use proper monitoring and alerting
+
+### Docker Security Considerations
+
+- The Docker Compose setup exposes several ports to the host. In production, consider restricting access using a proper network configuration.
+- Default credentials are included in the env.example file. Always change these for production deployments.
+- Secret management: Consider using Docker secrets or a dedicated solution like HashiCorp Vault for managing sensitive information.
+
+## Performance Tuning
+
+### Database Optimization
+- Proper indexes have been added to commonly queried fields
+- Custom QuerySets and Managers optimize database access patterns
+- Bulk operations are used for efficiency with large datasets
+
+### Container Performance
+The `deploy` section in the compose file includes resource reservations and limits for the worker containers. The default configuration is designed to work with the application's internal CPU affinity and resource management features, but you may need to adjust based on your server capacity and workload requirements.
+
 ## Dependencies
 
 The project uses dependencies with specific versions as defined in `requirements.txt`:
 
 - **Web Framework**: Django==5.2, djangorestframework==3.14.0
 - **Speech Recognition**: vosk==0.3.45, SoundFile==0.10.3.post1
-- **Translation**: argostranslate==1.9.6
-- **Messaging**: pika==1.3.2 (RabbitMQ client)
-- **Caching**: redis==5.0.0, django-redis==5.3.0
-- **Database**: psycopg2-binary==2.9.6 (PostgreSQL)
-- **Monitoring**: prometheus_client==0.17.1, psutil==5.9.6
-- **Audio Processing**: pydub==0.25.1
-- **HTTP**: requests==2.32.3
-- **Environment**: python-dotenv==1.0.0
-
-All dependencies use pinned versions to ensure consistent behavior across environments.
-
-## Configuration
-
-The application uses environment variables for configuration. Create a `.env` file in the project root:
-
-```
-# Django settings
-SECRET_KEY=your-secret-key-here
-DEBUG=True
-ALLOWED_HOSTS=localhost,127.0.0.1
-
-# Database settings
-DB_ENGINE=django.db.backends.postgresql
-DB_NAME=asr_translator
-DB_USER=postgres
-DB_PASSWORD=your-password-here
-DB_HOST=localhost
-DB_PORT=5432
-
-# Other settings...
-```
-
-You can generate a complete `.env` file with secure values by running:
-```bash
-python generate_env.py
-```
-
-## Limitations
-
-- Only supports WAV audio files
-- Maximum file size: 10MB
-- Rate limit: 10 requests per minute per IP
-- English to Persian translation only
-
-## Error Handling
-
-The system includes comprehensive error handling:
-- Connection retry logic for RabbitMQ
-- Automatic file cleanup on errors
-- Health checks for all services
-- Detailed logging across all components
-
-## Contributing
-
-1. Fork the repository
-2. Create your feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a new Pull Request
-
-## License
-
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- [VOSK](https://alphacephei.com/vosk/) for speech recognition
-- [Argostranslate](https://www.argosopentech.com/) for translation
-- [RabbitMQ](https://www.rabbitmq.com/) for message queuing
-- [Django](https://www.djangoproject.com/) for the web framework
-- [Prometheus](https://prometheus.io/) for metrics collection
-- [Grafana](https://grafana.com/) for metrics visualization
-- [PostgreSQL](https://www.postgresql.org/) for database
-- [Redis](https://redis.io/) for caching
+- **Translation**: argostranslate==1.8.0
+- **Messaging**: pika==1.3.2
+- **Caching**: redis==4.5.5, django-redis==5.2.0
+- **Database**: psycopg2-binary==2.9.6
+- **Monitoring**: prometheus-client==0.16.0
+- **HTTP**: requests==2.28.2
+- **Utils**: python-dotenv==1.0.0, numpy==1.24.3

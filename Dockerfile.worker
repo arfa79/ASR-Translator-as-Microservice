@@ -1,0 +1,52 @@
+FROM python:3.10-slim
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libsndfile1 \
+    ffmpeg \
+    wget \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Create model directories
+RUN mkdir -p /app/models/vosk /app/models/argos
+
+# Copy project files
+COPY asr_system.py .
+COPY translator_agent.py .
+COPY asr_translator /app/asr_translator
+
+# Create directories
+RUN mkdir -p /app/media/uploads /app/logs
+
+# Set permissions
+RUN chmod -R 755 /app
+
+# Download VOSK model (smaller English model for demonstration, replace with full model in production)
+RUN wget -q https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip \
+    && unzip vosk-model-small-en-us-0.15.zip -d /app/models/vosk \
+    && mv /app/models/vosk/vosk-model-small-en-us-0.15 /app/models/vosk/en-us \
+    && rm vosk-model-small-en-us-0.15.zip
+
+# ARG to determine which service to run
+ARG SERVICE=asr
+ENV SERVICE_TYPE=${SERVICE}
+
+# Start script to determine which service to run
+COPY docker-worker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-worker-entrypoint.sh
+
+ENTRYPOINT ["docker-worker-entrypoint.sh"] 
