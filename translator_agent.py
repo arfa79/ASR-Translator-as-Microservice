@@ -5,7 +5,16 @@ import django
 import time
 import logging
 import threading
+import hashlib
 from argostranslate import package, translate
+import redis
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    logging.warning("psutil not available, CPU affinity settings will be disabled")
 
 # Setup logging
 logging.basicConfig(
@@ -20,6 +29,54 @@ django.setup()
 
 from django.conf import settings
 from audio_processing.models import AudioProcessingTask
+
+# Redis configuration
+REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.environ.get('REDIS_PORT', 6379))
+REDIS_DB = int(os.environ.get('REDIS_DB', 0))
+REDIS_ENABLED = os.environ.get('REDIS_ENABLED', 'True').lower() in ('true', '1', 't')
+CACHE_EXPIRY = 3600 * 24 * 1  # Cache for 1 day by default
+CPU_AFFINITY_ENABLED = os.environ.get('CPU_AFFINITY_ENABLED', 'True').lower() in ('true', '1', 't')
+
+# Initialize Redis client if enabled
+redis_client = None
+if REDIS_ENABLED:
+    try:
+        redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
+        redis_client.ping()  # Test connection
+        logging.info(f"Redis cache connected successfully: {REDIS_HOST}:{REDIS_PORT}")
+    except Exception as e:
+        logging.warning(f"Redis cache connection failed: {str(e)}")
+        logging.warning("Translation caching will be disabled")
+        redis_client = None
+
+def set_cpu_affinity():
+    """Set CPU affinity for the Translation service if psutil is available"""
+    if not PSUTIL_AVAILABLE or not CPU_AFFINITY_ENABLED:
+        return
+    
+    try:
+        # Get the current process
+        process = psutil.Process()
+        
+        # Get the number of CPU cores
+        cpu_count = psutil.cpu_count(logical=False)  # Physical cores only
+        if cpu_count is None:
+            cpu_count = psutil.cpu_count(logical=True)  # Logical cores as fallback
+        
+        if cpu_count is None or cpu_count < 2:
+            logging.warning("Not enough CPU cores for affinity settings")
+            return
+        
+        # For Translation service, use the second half of available cores
+        # This complements the ASR service which uses the first half
+        cores_to_use = list(range((cpu_count + 1) // 2, cpu_count))
+        
+        # Set affinity
+        process.cpu_affinity(cores_to_use)
+        logging.info(f"Set CPU affinity to cores: {cores_to_use}")
+    except Exception as e:
+        logging.error(f"Error setting CPU affinity: {str(e)}")
 
 def setup_translation():
     """Setup Argostranslate with English to Persian translation"""
@@ -46,6 +103,57 @@ def setup_translation():
     except Exception as e:
         logging.error(f"Error setting up translation: {str(e)}")
         raise
+
+def get_cached_translation(text):
+    """Get a cached translation if available"""
+    if not redis_client:
+        return None
+    
+    # Create a cache key based on the text
+    cache_key = f"translation:{hashlib.md5(text.encode('utf-8')).hexdigest()}"
+    
+    try:
+        cached = redis_client.get(cache_key)
+        if cached:
+            translation = cached.decode('utf-8')
+            logging.info(f"Cache hit for text: '{text[:30]}...'")
+            return translation
+    except Exception as e:
+        logging.error(f"Redis cache retrieval error: {str(e)}")
+    
+    return None
+
+def cache_translation(text, translation):
+    """Cache a translation for future use"""
+    if not redis_client:
+        return
+    
+    # Create a cache key based on the text
+    cache_key = f"translation:{hashlib.md5(text.encode('utf-8')).hexdigest()}"
+    
+    try:
+        redis_client.set(cache_key, translation, ex=CACHE_EXPIRY)
+        logging.info(f"Cached translation for text: '{text[:30]}...'")
+    except Exception as e:
+        logging.error(f"Redis cache storage error: {str(e)}")
+
+def perform_translation(text):
+    """Translate text from English to Persian using Argostranslate"""
+    # First check if we have a cached version
+    cached_translation = get_cached_translation(text)
+    if cached_translation:
+        return cached_translation
+    
+    # No cache hit, perform the translation
+    logging.info("Cache miss, performing translation...")
+    installed_languages = translate.get_installed_languages()
+    translation_en_fa = installed_languages[0].get_translation(installed_languages[1])
+    translation = translation_en_fa.translate(text)
+    
+    # Cache the result for future use
+    cache_translation(text, translation)
+    
+    return translation
 
 def callback(ch, method, properties, body):
     """Handle incoming TranscriptionGenerated events"""
@@ -76,11 +184,9 @@ def callback(ch, method, properties, body):
         task.status = 'translating'
         task.save()
         
-        # Perform translation
+        # Perform translation with caching
         logging.info("Starting translation...")
-        installed_languages = translate.get_installed_languages()
-        translation_en_fa = installed_languages[0].get_translation(installed_languages[1])
-        translation = translation_en_fa.translate(text)
+        translation = perform_translation(text)
         logging.info("Translation completed")
         
         # Update task with translation
@@ -171,6 +277,14 @@ def check_health():
                 logging.warning("Health check: English-Persian translation model not found")
             else:
                 logging.info("Health check: Translation model OK")
+            
+            # Check Redis if enabled
+            if redis_client:
+                try:
+                    redis_client.ping()
+                    logging.info("Health check: Redis cache OK")
+                except Exception as e:
+                    logging.warning(f"Health check: Redis cache error: {str(e)}")
                 
         except Exception as e:
             logging.error(f"Health check failed: {str(e)}")
@@ -179,6 +293,9 @@ def check_health():
 
 def main():
     try:
+        # Set CPU affinity for better performance
+        set_cpu_affinity()
+        
         # Setup translation
         setup_translation()
         
@@ -190,13 +307,25 @@ def main():
         connection = get_rabbitmq_connection()
         channel = connection.channel()
         
-        # Setup channel
+        # Setup channel - declare exchange
         channel.exchange_declare(exchange=settings.RABBITMQ_EXCHANGE, exchange_type='fanout')
-        result = channel.queue_declare(queue='', exclusive=True)
+        
+        # Declare queue with priority support
+        result = channel.queue_declare(
+            queue='translation_queue',  # Named queue for better visibility
+            durable=True,  # Survive broker restarts
+            arguments={
+                'x-max-priority': 10  # Enable priority from 1-10
+            }
+        )
         queue_name = result.method.queue
+        
+        # Bind queue to the exchange
         channel.queue_bind(exchange=settings.RABBITMQ_EXCHANGE, queue=queue_name)
         
         logging.info("Translation Service is running. Waiting for transcriptions...")
+        # Process higher priority messages first
+        channel.basic_qos(prefetch_count=1)  # Only take one message at a time
         channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
         channel.start_consuming()
     except KeyboardInterrupt:

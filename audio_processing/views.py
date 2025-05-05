@@ -54,11 +54,30 @@ def publish_event(event_type, payload):
         # Add event_type to payload
         payload['event_type'] = event_type
         
-        # Publish message
+        # Determine message priority based on file size if available
+        priority = None
+        if 'file_path' in payload and os.path.exists(payload['file_path']):
+            file_size = os.path.getsize(payload['file_path'])
+            # Higher priority (8-10) for smaller files (process these first)
+            # Lower priority (1-3) for larger files
+            if file_size < 1 * 1024 * 1024:  # Less than 1MB
+                priority = 10
+            elif file_size < 5 * 1024 * 1024:  # 1-5MB
+                priority = 7
+            elif file_size < 10 * 1024 * 1024:  # 5-10MB
+                priority = 5
+            else:  # Larger than 10MB
+                priority = 3
+            logging.info(f"Setting message priority to {priority} for file size {file_size/1024/1024:.2f}MB")
+        
+        # Publish message with priority if available
+        properties = pika.BasicProperties(priority=priority) if priority else None
+        
         channel.basic_publish(
             exchange=settings.RABBITMQ_EXCHANGE,
             routing_key='',
-            body=json.dumps(payload)
+            body=json.dumps(payload),
+            properties=properties
         )
         connection.close()
         logging.info(f"Published {event_type} event")

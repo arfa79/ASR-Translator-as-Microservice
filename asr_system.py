@@ -11,6 +11,13 @@ import subprocess
 from vosk import Model, KaldiRecognizer
 import wave
 
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    logging.warning("psutil not available, CPU affinity settings will be disabled")
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +36,64 @@ from audio_processing.models import AudioProcessingTask
 LARGE_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 MAX_WORKERS = 4  # Maximum number of parallel workers
 SEGMENT_DURATION = 30  # Segment duration in seconds for parallel processing
+CPU_AFFINITY_ENABLED = os.environ.get('CPU_AFFINITY_ENABLED', 'True').lower() in ('true', '1', 't')
+
+# Global model cache
+global_model = None
+model_lock = threading.Lock()
+
+def set_cpu_affinity():
+    """Set CPU affinity for the ASR service if psutil is available"""
+    if not PSUTIL_AVAILABLE or not CPU_AFFINITY_ENABLED:
+        return
+    
+    try:
+        # Get the current process
+        process = psutil.Process()
+        
+        # Get the number of CPU cores
+        cpu_count = psutil.cpu_count(logical=False)  # Physical cores only
+        if cpu_count is None:
+            cpu_count = psutil.cpu_count(logical=True)  # Logical cores as fallback
+        
+        if cpu_count is None or cpu_count < 2:
+            logging.warning("Not enough CPU cores for affinity settings")
+            return
+        
+        # For ASR service, use the first half of available cores (rounded up)
+        # This leaves the second half for other services
+        cores_to_use = list(range(0, (cpu_count + 1) // 2))
+        
+        # Set affinity
+        process.cpu_affinity(cores_to_use)
+        logging.info(f"Set CPU affinity to cores: {cores_to_use}")
+    except Exception as e:
+        logging.error(f"Error setting CPU affinity: {str(e)}")
+
+def get_model(model_path="vosk-model-small-en-us-0.15"):
+    """Get the ASR model, using a cached version if available"""
+    global global_model
+    
+    # If the model is already loaded, return it
+    if global_model is not None:
+        return global_model
+    
+    # Use a lock to prevent multiple threads from loading the model simultaneously
+    with model_lock:
+        # Check again in case another thread loaded the model while we were waiting
+        if global_model is not None:
+            return global_model
+            
+        # Check if model exists
+        if not os.path.exists(model_path):
+            logging.error(f"VOSK model not found at {model_path}")
+            raise FileNotFoundError(f"VOSK model not found at {model_path}")
+        
+        logging.info(f"Loading VOSK model from {model_path} (initial load)")
+        global_model = Model(model_path)
+        logging.info("Model loaded successfully and cached globally")
+        
+        return global_model
 
 def split_audio_file(file_path, segment_duration=SEGMENT_DURATION):
     """Split a large audio file into smaller segments for parallel processing"""
@@ -98,7 +163,8 @@ def combine_transcription_results(results):
 def process_audio_segment(segment_path, model_path):
     """Process a single audio segment - to be used in parallel processing"""
     try:
-        model = Model(model_path)
+        # Use the global model cache
+        model = get_model(model_path)
         wf = wave.open(segment_path, "rb")
         sample_rate = wf.getframerate()
         
@@ -132,11 +198,6 @@ def process_audio_parallel(file_path):
     model_path = "vosk-model-small-en-us-0.15"
     
     try:
-        # Check if model exists
-        if not os.path.exists(model_path):
-            logging.error(f"VOSK model not found at {model_path}")
-            raise FileNotFoundError(f"VOSK model not found at {model_path}")
-        
         # Check file size
         file_size = os.path.getsize(file_path)
         
@@ -202,16 +263,8 @@ def process_audio(file_path):
     model_path = "vosk-model-small-en-us-0.15"
     
     try:
-        # Load VOSK model
-        if not os.path.exists(model_path):
-            logging.error(f"VOSK model not found at {model_path}")
-            raise FileNotFoundError(
-                f"VOSK model not found at {model_path}. Please download it from "
-                "https://alphacephei.com/vosk/models and extract to the project directory."
-            )
-            
-        logging.info(f"Loading VOSK model from {model_path}")
-        model = Model(model_path)
+        # Use the global model cache instead of loading it each time
+        model = get_model(model_path)
         wf = wave.open(file_path, "rb")
         
         # Get the sample rate from the file
@@ -299,6 +352,9 @@ def callback(ch, method, properties, body):
         file_path = message['file_path']
         
         logging.info(f"Received AudioFileUploaded event for file_id: {file_id}")
+        # Get message priority if available
+        message_priority = properties.priority if properties and hasattr(properties, 'priority') else None
+        logging.info(f"Message priority: {message_priority}")
         
         # Update task status
         task = AudioProcessingTask.objects.get(file_id=file_id)
@@ -321,10 +377,16 @@ def callback(ch, method, properties, body):
             'text': text
         }
         
+        # Preserve original message priority
+        publish_properties = None
+        if message_priority:
+            publish_properties = pika.BasicProperties(priority=message_priority)
+        
         channel.basic_publish(
             exchange=settings.RABBITMQ_EXCHANGE,
             routing_key='',
-            body=json.dumps(message)
+            body=json.dumps(message),
+            properties=publish_properties
         )
         connection.close()
         logging.info(f"Published TranscriptionGenerated event for file_id: {file_id}")
@@ -372,12 +434,12 @@ def check_health():
             connection.close()
             logging.info("Health check: RabbitMQ connection OK")
             
-            # Check VOSK model
-            model_path = "vosk-model-small-en-us-0.15"
-            if not os.path.exists(model_path):
-                logging.warning("Health check: VOSK model not found")
-            else:
-                logging.info("Health check: VOSK model OK")
+            # Check VOSK model - use get_model to check the cached model
+            try:
+                model = get_model()
+                logging.info("Health check: VOSK model OK (cached)")
+            except Exception as e:
+                logging.warning(f"Health check: VOSK model issue: {str(e)}")
                 
         except Exception as e:
             logging.error(f"Health check failed: {str(e)}")
@@ -386,6 +448,16 @@ def check_health():
 
 def main():
     try:
+        # Set CPU affinity for better performance
+        set_cpu_affinity()
+        
+        # Preload the model at startup
+        try:
+            get_model()
+            print("VOSK model preloaded successfully!")
+        except Exception as e:
+            print(f"Warning: Failed to preload VOSK model: {str(e)}")
+        
         # Start health check in background thread
         health_thread = threading.Thread(target=check_health, daemon=True)
         health_thread.start()
@@ -394,13 +466,25 @@ def main():
         connection = get_rabbitmq_connection()
         channel = connection.channel()
         
-        # Setup channel
+        # Setup channel - declare exchange
         channel.exchange_declare(exchange=settings.RABBITMQ_EXCHANGE, exchange_type='fanout')
-        result = channel.queue_declare(queue='', exclusive=True)
+        
+        # Declare queue with priority support
+        result = channel.queue_declare(
+            queue='asr_processing_queue',  # Named queue for better visibility
+            durable=True,  # Survive broker restarts
+            arguments={
+                'x-max-priority': 10  # Enable priority from 1-10
+            }
+        )
         queue_name = result.method.queue
+        
+        # Bind queue to the exchange
         channel.queue_bind(exchange=settings.RABBITMQ_EXCHANGE, queue=queue_name)
         
         print("ASR Service is running. Waiting for audio files...")
+        # Process higher priority messages first
+        channel.basic_qos(prefetch_count=1)  # Only take one message at a time
         channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
         channel.start_consuming()
     except KeyboardInterrupt:
