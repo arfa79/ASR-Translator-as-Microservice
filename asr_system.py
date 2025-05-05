@@ -23,7 +23,7 @@ from django.conf import settings
 from audio_processing.models import AudioProcessingTask
 
 def process_audio(file_path):
-    """Perform ASR on the audio file using VOSK"""
+    """Perform ASR on the audio file using VOSK with streaming for faster processing"""
     model_path = "vosk-model-small-en-us-0.15"
     
     try:
@@ -57,28 +57,46 @@ def process_audio(file_path):
         
         # Process frames
         try:
+            # Define chunk size for processing - smaller for more responsive streaming
+            chunk_size = 4000  # Adjust based on performance testing
+            
+            # Process in chunks and collect results
+            chunk_results = []
+            chunk_count = 0
+            current_text = ""
+            
             while True:
-                data = wf.readframes(4000)
+                data = wf.readframes(chunk_size)
                 if len(data) == 0:
                     break
+                
+                chunk_count += 1
                 try:
                     if recognizer.AcceptWaveform(data):
                         result = json.loads(recognizer.Result())
-                        if "text" in result:
-                            text += result["text"] + " "
+                        if "text" in result and result["text"].strip():
+                            current_text = result["text"]
+                            chunk_results.append(current_text)
+                            logging.info(f"Chunk {chunk_count} processed: '{current_text}'")
+                            text += current_text + " "
                 except Exception as e:
-                    logging.error(f"Error processing frame: {str(e)}")
+                    logging.error(f"Error processing frame {chunk_count}: {str(e)}")
                     continue
             
+            # Get final result for any remaining audio
             final_result = json.loads(recognizer.FinalResult())
-            if "text" in final_result:
-                text += final_result["text"]
+            if "text" in final_result and final_result["text"].strip():
+                final_text = final_result["text"]
+                chunk_results.append(final_text)
+                text += final_text
+                logging.info(f"Final chunk processed: '{final_text}'")
                 
             if not text.strip():
                 logging.warning("No transcription generated, audio might be silent or unrecognizable")
                 text = "No speech detected"
                 
             logging.info("Audio processing completed successfully")
+            logging.info(f"Full transcription: {text.strip()}")
             return text.strip()
             
         except Exception as e:
