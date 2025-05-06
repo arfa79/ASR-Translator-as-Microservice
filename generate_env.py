@@ -66,6 +66,9 @@ def main():
         redis_db = input("Redis DB (default: 0): ") or '0'
         
         enable_autoscaling = input("Enable autoscaling? (y/n, default: n): ").lower() == 'y'
+        
+        # Add VOSK model path
+        vosk_model_path = input("VOSK model path (default: vosk-model-small-en-us-0.15): ") or 'vosk-model-small-en-us-0.15'
     else:
         rabbitmq_host = 'localhost'
         rabbitmq_port = '5672'
@@ -74,6 +77,7 @@ def main():
         redis_port = '6379'
         redis_db = '0'
         enable_autoscaling = False
+        vosk_model_path = 'vosk-model-small-en-us-0.15'
     
     # Create the .env file
     with open(env_file, 'w') as f:
@@ -100,6 +104,9 @@ def main():
         f.write(f"REDIS_PORT={redis_port}\n")
         f.write(f"REDIS_DB={redis_db}\n")
         
+        f.write(f"\n# ASR settings\n")
+        f.write(f"VOSK_MODEL_PATH={vosk_model_path}\n")
+        
         f.write(f"\n# Autoscaling settings\n")
         f.write(f"ENABLE_AUTOSCALING={'True' if enable_autoscaling else 'False'}\n")
         f.write(f"PROMETHEUS_URL=http://localhost:9090\n")
@@ -122,6 +129,10 @@ def main():
     
     print("\nTo apply database migrations, run:")
     print("  python manage.py migrate")
+    
+    print("\nMake sure the VOSK model is available at:")
+    print(f"  {vosk_model_path}")
+    print("You can download it from: https://alphacephei.com/vosk/models")
 
 if __name__ == "__main__":
     main() 
