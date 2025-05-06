@@ -6,13 +6,13 @@ import sys
 
 try:
     print("Attempting to load model...")
-    model_path = "vosk-model-small-en-us-0.15/"
+    model_path = "../vosk-model-small-en-us-0.15/"
     if not os.path.exists(model_path):
         print(f"Model path '{model_path}' does not exist")
         sys.exit(1)
         
     # List audio files in media/uploads
-    media_dir = "media/uploads"
+    media_dir = "../media/uploads"
     if os.path.exists(media_dir):
         print(f"Audio files in {media_dir}:")
         for file in os.listdir(media_dir):
@@ -21,7 +21,7 @@ try:
     
     # Find a sample wav file
     test_file = None
-    for root, dirs, files in os.walk("media"):
+    for root, dirs, files in os.walk("../media/uploads"):
         for file in files:
             if file.endswith(".wav"):
                 test_file = os.path.join(root, file)
