@@ -33,7 +33,7 @@ All components communicate asynchronously through RabbitMQ events.
 - Python 3.11+
 - RabbitMQ Server
 - VOSK English model (vosk-model-small-en-us-0.15)
-- Docker (optional, for containerized deployment)
+- Docker
 - Prometheus & Grafana (for monitoring)
 - PostgreSQL (recommended) or SQLite
 - Redis (for caching)
@@ -44,7 +44,7 @@ All components communicate asynchronously through RabbitMQ events.
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/ASR-Translator-as-Microservice.git
+git clone https://github.com/arfa79/ASR-Translator-as-Microservice.git
 cd ASR-Translator-as-Microservice
 ```
 

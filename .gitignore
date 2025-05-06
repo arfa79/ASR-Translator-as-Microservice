@@ -8,6 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+vosk-model-small-en-us-0.15/
 build/
 develop-eggs/
 dist/
