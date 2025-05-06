@@ -175,20 +175,31 @@ docker-compose ps
 
 The system includes a comprehensive testing suite in the `tests/` directory:
 
-1. To test the VOSK speech recognition model:
+To run all tests using pytest:
 ```bash
-python tests/test_vosk.py --audio path/to/audio.wav
+# Run all tests
+cd tests
+pytest
 ```
 
-2. To test the complete system end-to-end:
-```bash
-python tests/test_system.py path/to/audio.wav
-```
+### Test Structure
 
-3. To run all tests automatically:
-```bash
-./tests/run_tests.sh
-```
+- **test_vosk_model.py**: Tests for the VOSK speech recognition functionality
+  - `test_model_loading`: Verifies VOSK model loading
+  - `test_recognizer_creation`: Tests KaldiRecognizer creation
+  - `test_audio_processing`: Tests standard audio file processing
+  - `test_8k_audio_processing`: Tests 8kHz audio file processing
+
+- **Integration Tests**: Tests for API endpoints and service communication
+- **Performance Tests**: Tests for system performance under load
+
+### Test Configuration
+
+The `conftest.py` file contains fixtures used across tests:
+- `vosk_model`: Loads the VOSK model for testing
+- `data_dir`: Creates and manages test data directory
+- `sample_audio_file`: Provides sample audio for testing
+- `service_url`: Configures the service URL for testing
 
 ## Usage
 
