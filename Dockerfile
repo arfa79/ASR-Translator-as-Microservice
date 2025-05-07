@@ -14,12 +14,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     libsndfile1 \
     ffmpeg \
+    unzip\
+    netcat-traditional \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+     pip install -r requirements.txt
 
 # Copy project
 COPY . .
