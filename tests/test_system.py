@@ -43,19 +43,19 @@ def print_json(data):
     
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
-def test_upload(audio_file, base_url="http://localhost:8000"):
+def test_upload(sample_audio_file, base_url="http://localhost:8000"):
     """Test uploading an audio file to the service"""
     print_header("Testing Audio File Upload")
     
-    if not os.path.exists(audio_file):
-        print_error(f"Audio file not found: {audio_file}")
+    if not os.path.exists(sample_audio_file):
+        print_error(f"Audio file not found: {sample_audio_file}")
         return None
     
     try:
-        print(f"Uploading file: {audio_file}")
+        print(f"Uploading file: {sample_audio_file}")
         url = f"{base_url}/upload/"
         
-        with open(audio_file, 'rb') as f:
+        with open(sample_audio_file, 'rb') as f:
             files = {'audio': f}
             response = requests.post(url, files=files)
         

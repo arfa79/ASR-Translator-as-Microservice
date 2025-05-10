@@ -6,7 +6,7 @@ import sys
 
 try:
     print("Attempting to load model...")
-    model_path = "../vosk-model-small-en-us-0.15/"
+    model_path = "../models/vosk-model-small-en-us-0.15/"
     if not os.path.exists(model_path):
         print(f"Model path '{model_path}' does not exist")
         sys.exit(1)
