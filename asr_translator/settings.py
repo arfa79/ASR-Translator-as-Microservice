@@ -161,6 +161,8 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 RABBITMQ_HOST = os.environ.get('RABBITMQ_HOST', 'localhost')
 RABBITMQ_PORT = int(os.environ.get('RABBITMQ_PORT', '5672'))
 RABBITMQ_EXCHANGE = os.environ.get('RABBITMQ_EXCHANGE', 'audio_events')
+RABBITMQ_USER = os.environ.get('RABBITMQ_USER', 'guest')
+RABBITMQ_PASSWORD = os.environ.get('RABBITMQ_PASSWORD', 'guest')
 
 # Redis Cache settings
 REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')
@@ -319,3 +321,14 @@ LOGGING = {
         },
     },
 }
+
+# Celery Configuration
+CELERY_BROKER_URL = f'amqp://{RABBITMQ_USER}:{RABBITMQ_PASSWORD}@{RABBITMQ_HOST}:{RABBITMQ_PORT}//'
+CELERY_RESULT_BACKEND = f'redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}'
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1

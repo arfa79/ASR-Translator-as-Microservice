@@ -128,7 +128,7 @@ class AudioProcessingTask(models.Model):
     
     # Use custom manager for optimized queries
     objects = AudioProcessingTaskManager()
-    
+
     class Meta:
         ordering = ['-created_at']
         verbose_name = _('Audio Processing Task')

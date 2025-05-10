@@ -1,100 +1,5 @@
 services:
-  # Main Django application
-  web:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    volumes:
-      - static_volume:/app/staticfiles
-      - media_volume:/app/media
-      - ./logs:/app/logs
-    env_file:
-      - ./.env
-    depends_on:
-      - db
-      - redis
-      - rabbitmq
-    networks:
-      - asr_network
-    ports:
-      - "8000:8000"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
-
-  # ASR Worker
-  asr_worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
-      args:
-        SERVICE: asr
-    restart: unless-stopped
-    volumes:
-      - media_volume:/app/media
-      - ./models:/app/models
-      - ./logs:/app/logs
-    env_file:
-      - ./.env
-    environment:
-      - SERVICE_TYPE=asr
-      # Optional CPU affinity override (comma-separated list of CPU IDs)
-      # - CPU_AFFINITY=0,1
-    depends_on:
-      - rabbitmq
-      - redis
-    networks:
-      - asr_network
-    # Using reservation instead of hard limits to allow for application's internal resource management
-    deploy:
-      resources:
-        reservations:
-          cpus: '1'
-          memory: 2G
-        # Soft limits to avoid container restrictions conflicting with app's CPU affinity
-        limits:
-          cpus: '0'  # 0 means no limit, letting the app manage CPU
-          memory: 6G  # Increased memory limit to accommodate peak usage
-      replicas: 2
-
-  # Translator Worker
-  translator_worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
-      args:
-        SERVICE: translator
-    restart: unless-stopped
-    volumes:
-      - media_volume:/app/media
-      - ./models:/app/models
-      - ./logs:/app/logs
-    env_file:
-      - ./.env
-    environment:
-      - SERVICE_TYPE=translator
-      # Optional CPU affinity override (comma-separated list of CPU IDs)
-      # - CPU_AFFINITY=2,3
-    depends_on:
-      - rabbitmq
-      - redis
-    networks:
-      - asr_network
-    deploy:
-      resources:
-        reservations:
-          cpus: '0.5'
-          memory: 1G
-        limits:
-          cpus: '0'
-          memory: 4G
-      replicas: 2
-
-  # PostgreSQL Database
+  # PostgreSQL Database (should start first)
   db:
     image: postgres:14-alpine
     restart: unless-stopped
@@ -110,12 +15,12 @@ services:
       - asr_network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
       retries: 5
       start_period: 10s
 
-  # Redis Cache
+  # Redis Cache (depends on db)
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -124,13 +29,16 @@ services:
     command: redis-server --appendonly yes
     networks:
       - asr_network
+    depends_on:
+      db:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
       retries: 5
 
-  # RabbitMQ Message Broker
+  # RabbitMQ Message Broker (depends on db and redis)
   rabbitmq:
     image: rabbitmq:3.11-management
     restart: unless-stopped
@@ -145,14 +53,125 @@ services:
       - "15672:15672"  # Management UI
     networks:
       - asr_network
+    depends_on:
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
-      interval: 30s
-      timeout: 10s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Main Django application (depends on db, redis, and rabbitmq)
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    volumes:
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+      - ./logs:/app/logs
+    env_file:
+      - ./.env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - asr_network
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c "python manage.py makemigrations &&
+             python manage.py migrate &&
+             python manage.py runserver 0.0.0.0:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/"]
+      interval: 10s
+      timeout: 5s
       retries: 5
       start_period: 30s
 
-  # Prometheus for metrics
+  # ASR Worker (depends on web, redis, and rabbitmq)
+  asr_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+      args:
+        SERVICE: asr
+    restart: unless-stopped
+    volumes:
+      - media_volume:/app/media
+      - ./models:/app/models
+      - ./logs:/app/logs
+    env_file:
+      - ./.env
+    environment:
+      - SERVICE_TYPE=asr
+      - C_FORCE_ROOT=true
+    depends_on:
+      web:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - asr_network
+    command: celery -A asr_translator worker -Q asr_queue -l info
+    deploy:
+      resources:
+        reservations:
+          cpus: '1'
+          memory: 2G
+        limits:
+          cpus: '0'
+          memory: 6G
+      replicas: 2
+
+  # Translator Worker (depends on web, redis, and rabbitmq)
+  translator_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+      args:
+        SERVICE: translator
+    restart: unless-stopped
+    volumes:
+      - media_volume:/app/media
+      - ./models:/app/models
+      - ./logs:/app/logs
+    env_file:
+      - ./.env
+    environment:
+      - SERVICE_TYPE=translator
+      - C_FORCE_ROOT=true
+    depends_on:
+      web:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - asr_network
+    command: celery -A asr_translator worker -Q translator_queue -l info
+    deploy:
+      resources:
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+        limits:
+          cpus: '0'
+          memory: 4G
+      replicas: 2
+
+  # Prometheus (depends on web)
   prometheus:
     image: prom/prometheus:v2.42.0
     restart: unless-stopped
@@ -170,9 +189,10 @@ services:
     networks:
       - asr_network
     depends_on:
-      - web
+      web:
+        condition: service_healthy
 
-  # Grafana for visualization
+  # Grafana (depends on prometheus)
   grafana:
     image: grafana/grafana:9.4.7
     restart: unless-stopped
@@ -188,7 +208,8 @@ services:
     networks:
       - asr_network
     depends_on:
-      - prometheus
+      prometheus:
+        condition: service_started
 
 # Volumes for persistent data
 volumes:

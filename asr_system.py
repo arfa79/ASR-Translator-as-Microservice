@@ -421,7 +421,7 @@ def callback(ch, method, properties, body):
             message = json.loads(body_str)
             logging.info("Received compressed message")
         else:
-            message = json.loads(body)
+        message = json.loads(body)
         
         if message['event_type'] != 'AudioFileUploaded':
             return
